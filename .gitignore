@@ -18,6 +18,7 @@ build/
 *.vtk
 *.vtu
 *.vti
+*.stl
 *.xdmf
 *.h5
 results/
