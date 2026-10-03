@@ -1,0 +1,25 @@
+name: imagemesh
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.10
+  - pip
+  - numpy
+  - scipy
+  - numba
+  - scikit-image
+  - networkx
+  - meshio
+  - h5py
+  - tqdm
+  - nibabel
+  - igl
+  - pytest
+  - ruff
+  - pip:
+      - vtk>=9.6
+      - pyvista
+      - pytetwild
+      - fastremap
+      - connected-components-3d
+      - nbmorph>=0.3.2

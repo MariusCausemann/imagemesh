@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.venv/
+
+# tools
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.pixi/*
+!.pixi/config.toml
+
+# data / results
+*.vtk
+*.vtu
+*.vti
+*.xdmf
+*.h5
+results/
+
+.DS_Store

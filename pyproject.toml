@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "imagemesh"
+version = "0.1.0.dev0"
+description = "Tetrahedral meshes of multi-label images: surface nets, simplification, fTetWild meshing and labelling"
+authors = [{ name = "Marius Causemann", email = "mariusca@simula.no" }]
+license = { file = "LICENSE" }
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "numba",
+    "pyvista",
+    "vtk>=9.6",
+    "pytetwild",
+    "fastremap",
+    "connected-components-3d",
+    "nbmorph>=0.3.2",
+    "networkx",
+    "scikit-image",
+    "meshio",
+    "h5py",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+nifti = ["nibabel"]
+test = ["pytest", "libigl", "nibabel"]
+dev = ["ruff", "mypy", "ipython"]
+
+[project.urls]
+homepage = "https://github.com/MariusCausemann/imagemesh"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = ["--import-mode=importlib"]
+testpaths = ["tests"]
+markers = ["slow: marks tests as slow (deselect with '-m not slow')"]
+
+[tool.mypy]
+ignore_missing_imports = true
+files = ["src", "tests"]
+
+[tool.ruff]
+src = ["src", "tests"]
+line-length = 100
+indent-width = 4
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "I001"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["imagemesh"]
+known-third-party = ["numpy", "pytest"]
