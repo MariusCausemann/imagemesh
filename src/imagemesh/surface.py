@@ -6,8 +6,11 @@ Conventions: cell data boundary_labels (a, b) per triangle, the normal points
 out of region a into region b; 0 is the background (outside).
 """
 
+import warnings
+
 import numba as nb
 import numpy as np
+import pyvista as pv
 from scipy.spatial import cKDTree
 
 from imagemesh.smoothing import smooth_surface_net
@@ -30,12 +33,103 @@ def extract_surface(grid, smoothing_scale=1.2, iterations=16, scalars="data", ba
         background_value=background_value,
         scalars=scalars,
     )
+    surf = close_quad_holes(surf)
     dx = np.min(grid.spacing)
     surf = smooth_surface_net(
         surf, iterations=iterations, distance=dx, scale=smoothing_scale, fix_bounds=True
     )
     surf.field_data["dx"] = [dx]
     return surf
+
+
+def close_quad_holes(surf, label_name="boundary_labels"):
+    """
+    Close the single-quad holes of a contour_labels quad mesh.
+
+    vtkSurfaceNets3D (VTK 9.7) splits the dual point of some non-manifold
+    voxel configurations into two coincident points and then drops the
+    (zero-area) quad between two such split points, e.g. for label 1 at
+    (0, 2, 2), (1, 0, 0), (1, 0, 1), (2, 0, 0), (2, 1, 1) and (2, 2, 2) of a 3^3
+    block of label 2. The hole's rim is four open edges of faces with one label
+    pair; each such loop is closed with a quad of that label pair, oriented like
+    its neighbours, which opens up in the smoothing.
+    """
+    quads = surf.regular_faces
+    labels = np.asarray(surf.cell_data[label_name])
+    new_quads, new_faces, n_open = _close_quad_holes(quads.astype(np.int64), labels, surf.n_points)
+    if n_open:
+        warnings.warn(f"close_quad_holes: {n_open} open edges are not on a single-quad hole")
+    if not len(new_quads):
+        return surf
+    out = pv.PolyData.from_regular_faces(
+        np.asarray(surf.points), np.vstack([quads, new_quads.astype(quads.dtype)])
+    )
+    out.cell_data[label_name] = np.vstack([labels, labels[new_faces]])
+    for name in surf.field_data:
+        out.field_data[name] = surf.field_data[name]
+    return out
+
+
+@nb.njit(cache=True)
+def _close_quad_holes(Q, L, n):
+    """
+    New quads closing the loops of four open edges of quads Q with one label
+    pair L, the quad whose labels each new quad takes, and the number of open
+    edges left.
+    """
+    m = 4 * len(Q)
+    key = np.empty(m, np.int64)
+    for f in range(len(Q)):
+        for i in range(4):
+            key[4 * f + i] = Q[f, i] * n + Q[f, (i + 1) % 4]
+    skey = np.sort(key)
+    # an open half-edge (a, b) has no reverse (b, a); the missing quad runs along (b, a)
+    U, V, F = [], [], []
+    for f in range(len(Q)):
+        for i in range(4):
+            a, b = Q[f, i], Q[f, (i + 1) % 4]
+            s = np.searchsorted(skey, b * n + a)
+            if s == m or skey[s] != b * n + a:
+                U.append(b)
+                V.append(a)
+                F.append(f)
+    U, V, F = np.array(U, np.int64), np.array(V, np.int64), np.array(F, np.int64)
+    # open edges grouped by start point
+    order = np.argsort(U, kind="mergesort")
+    su = U[order]
+    used = np.zeros(len(U), np.bool_)
+
+    def out_edges(p):
+        return order[np.searchsorted(su, p) : np.searchsorted(su, p, side="right")]
+
+    def fits(e, f0):
+        return not used[e] and L[F[e], 0] == L[f0, 0] and L[F[e], 1] == L[f0, 1]
+
+    new_quads, new_faces = [], []
+    for e0 in range(len(U)):
+        if used[e0]:
+            continue
+        f0, p0, p1 = F[e0], U[e0], V[e0]
+        found = False
+        for e1 in out_edges(p1):
+            p2 = V[e1]
+            if found or not fits(e1, f0) or p2 == p0 or p2 == p1:
+                continue
+            for e2 in out_edges(p2):
+                p3 = V[e2]
+                if found or not fits(e2, f0) or p3 == p0 or p3 == p1 or p3 == p2:
+                    continue
+                for e3 in out_edges(p3):
+                    if found or not fits(e3, f0) or V[e3] != p0:
+                        continue
+                    found = True
+                    used[e0] = used[e1] = used[e2] = used[e3] = True
+                    new_quads.append((p0, p1, p2, p3))
+                    new_faces.append(f0)
+    nq = np.empty((len(new_quads), 4), np.int64)
+    for k in range(len(new_quads)):
+        nq[k] = new_quads[k]
+    return nq, np.array(new_faces, np.int64), len(U) - 4 * len(new_quads)
 
 
 def transfer_labels(source_mesh, target_mesh, label_name="boundary_labels"):
