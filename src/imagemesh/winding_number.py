@@ -340,6 +340,16 @@ def label_points(V, F, boundary_labels, Q, **kwargs):
     Since the regions partition the domain, each channel is 0 or +-1, so all
     labels are found with ceil(log2(n + 1)) channels in a single traversal.
 
+    Where the surface folds (two sheets cross, so regions overlap or a region
+    is turned inside out), the winding numbers of several regions add up in
+    each channel, and the bits can combine to the index of an unrelated
+    region far away. So every point is checked against the region it was
+    classified into (its winding number with respect to that region's
+    boundary alone, one more traversal of the surface in total), and against
+    an extra channel for the whole domain if it was classified outside. The
+    points that fail are classified again with one channel per region: among
+    the regions they are inside, they get the one bounded by the nearest face.
+
     Returns:
         (nq,) labels, 0 for points outside all regions.
     """
@@ -348,9 +358,54 @@ def label_points(V, F, boundary_labels, Q, **kwargs):
     code = np.searchsorted(lut, boundary_labels)
     K = max(1, int(code.max()).bit_length())
     bits = (code[:, :, None] >> np.arange(K)) & 1
-    W = bits[:, 0] - bits[:, 1]
+    # bit channels, then the indicator of the whole domain
+    W = np.c_[bits[:, 0] - bits[:, 1], (code[:, 0] > 0).astype(int) - (code[:, 1] > 0)]
     wn = weighted_winding_numbers(V, F, W, Q, **kwargs)
-    idx = (np.abs(wn) > 0.5) @ (1 << np.arange(K))
-    # bits of all regions near a point can mix to an index that does not exist
-    idx[idx >= len(lut)] = 0
+    # orientation: the domain channel is +1 or -1 inside, consistently
+    inside = np.abs(wn[:, K]) > 0.5
+    sign = np.sign(np.median(wn[inside, K])) if inside.any() else 1.0
+    wn *= sign
+    idx = (wn[:, :K] > 0.5) @ (1 << np.arange(K))
+
+    # a point is consistent if it is inside the region it was classified
+    # into, or outside the domain if it was classified outside
+    ok = np.zeros(len(Q), dtype=bool)
+    ok[idx == 0] = wn[idx == 0, K] < 0.5
+    for i in np.unique(idx[(idx > 0) & (idx < len(lut))]):
+        sel = np.flatnonzero(idx == i)
+        mask = (code == i).any(axis=1)
+        w = (code[mask, 0] == i).astype(float) - (code[mask, 1] == i)
+        wi = weighted_winding_numbers(V, F[mask], w[:, None], Q[sel], **kwargs)[:, 0]
+        ok[sel] = sign * wi > 0.5
+    bad = np.flatnonzero(~ok)
+    if len(bad):
+        idx[bad] = _resolve_folds(V, F, code, len(lut), Q[bad], sign, **kwargs)
     return lut[idx]
+
+
+def _resolve_folds(V, F, code, n, Q, sign, **kwargs):
+    """Indices of the points Q from one winding number channel per region:
+    among the regions a point is inside, the one bounded by the nearest face
+    (0 if it is inside none)."""
+    from scipy.spatial import cKDTree
+
+    regions = np.arange(1, n)
+    W = (code[:, :1] == regions).astype(float) - (code[:, 1:] == regions)
+    inside = sign * weighted_winding_numbers(V, F, W, Q, **kwargs) > 0.5
+    idx = np.zeros(len(Q), dtype=np.int64)
+    one = inside.sum(axis=1) == 1
+    idx[one] = regions[inside[one].argmax(axis=1)]
+    several = np.flatnonzero(inside.sum(axis=1) > 1)
+    if len(several):
+        cent = V[F].mean(axis=1)
+        k = min(len(F), 32)
+        _, near = cKDTree(cent).query(Q[several], k=k)
+        for p, faces in zip(several, near.reshape(len(several), k)):
+            for f in faces:
+                hit = [c for c in code[f] if c > 0 and inside[p, c - 1]]
+                if hit:
+                    idx[p] = hit[0]
+                    break
+            else:
+                idx[p] = regions[inside[p]][0]
+    return idx
