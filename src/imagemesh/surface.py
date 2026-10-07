@@ -16,7 +16,9 @@ from scipy.spatial import cKDTree
 from imagemesh.smoothing import smooth_surface_net
 
 
-def extract_surface(grid, smoothing_scale=1.2, iterations=16, scalars="data", background_value=0):
+def extract_surface(
+    grid, smoothing_scale=1.2, iterations=16, scalars="data", background_value=0, degenerate=None
+):
     """
     Smoothed, triangulated multi-label surface of the label image grid
     (pv.ImageData with the labels as cell data `scalars`), with cell data
@@ -25,6 +27,11 @@ def extract_surface(grid, smoothing_scale=1.2, iterations=16, scalars="data", ba
     the bounding box on their box face.
     The displacement of each point is limited to smoothing_scale * dx; dx is
     stored in the field data.
+    degenerate: build_stencils' treatment of quads whose opposite corners have
+    nested junction stencils. None (VTK) keeps junction curves smoothed as
+    curves; "full" un-pins those corners at every voxel step of a one-voxel-wide
+    strip between two junction curves (e.g. where the falx meets the outer
+    boundary) and creases the strip by up to a voxel.
     """
     surf = grid.contour_labels(
         "all",
@@ -36,7 +43,12 @@ def extract_surface(grid, smoothing_scale=1.2, iterations=16, scalars="data", ba
     surf = close_quad_holes(surf)
     dx = np.min(grid.spacing)
     surf = smooth_surface_net(
-        surf, iterations=iterations, distance=dx, scale=smoothing_scale, fix_bounds=True
+        surf,
+        iterations=iterations,
+        distance=dx,
+        scale=smoothing_scale,
+        fix_bounds=True,
+        degenerate=degenerate,
     )
     surf.field_data["dx"] = [dx]
     return surf

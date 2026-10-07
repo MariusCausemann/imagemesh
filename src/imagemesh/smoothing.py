@@ -204,6 +204,7 @@ def smooth_surface_net(
     fixed=None,
     fix_bounds=False,
     triangulate=True,
+    degenerate="full",
 ):
     """
     Smooth a surface from contour_labels(smoothing=False, output_mesh_type="quads")
@@ -212,11 +213,12 @@ def smooth_surface_net(
 
     fixed: (n_points, 3) bool mask of coordinates that must not move.
     fix_bounds: additionally keep points on the bounding box on their box face.
+    degenerate: see build_stencils; None is the VTK behaviour.
     """
     quads = surf.regular_faces
     if distance is None:
         distance = np.linalg.norm(spacing)
-    A = build_stencils(quads, surf.n_points, optimized=optimized)
+    A = build_stencils(quads, surf.n_points, optimized=optimized, degenerate=degenerate)
 
     fixed = np.zeros((surf.n_points, 3), dtype=bool) if fixed is None else np.asarray(fixed)
     if fix_bounds:
