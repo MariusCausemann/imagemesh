@@ -10,10 +10,13 @@ new handles, the handle cut.
    contain every loop up to max_loop_length (a closed curve of length L lies within
    L / 4 of its bounding box centre). In each window the check is repeated, and
    only the cells that fail it are skeletonized, cropped to the window. The minimum
-   cycle basis of the skeleton graph gives one short loop around each tunnel,
-   running through the cell; a loop is handled by the window whose core contains
-   its centre. Small handles are filled at the small scales, so the large windows
-   only see the handles that are left.
+   cycle basis of the skeleton graph gives one loop around each tunnel, running
+   through the cell; a loop is handled by the window whose core contains its centre.
+   The thinning leaves a loop anywhere between the tunnel and the outer surface of
+   the cell (in a sheet with a small hole, about halfway to the edge of the sheet), so
+   it is tightened: the shortest loop through the cell that crosses a cross-section
+   of the cell once goes around the same tunnel and hugs it. Small handles are filled
+   at the small scales, so the large windows only see the handles that are left.
 3. Each loop is spanned by a harmonic membrane (Laplace solve on a polar grid with
    the loop as fixed boundary), voxelized with thickness N and assigned to the cell
    (overwriting the ECS and other cells) if that raises the cell's Euler
@@ -23,7 +26,6 @@ new handles, the handle cut.
    membranes are filled. If the membrane would create new handles (the loop is
    linked with another part of the cell), the handle is cut instead: the smallest
    cross-section of the cell normal to the loop that removes it is set to 0.
-
 Handles with loops longer than max_loop_length are left. With workers > 1, the
 windows are processed in a forkserver pool (numba's OpenMP layer is not fork-safe),
 with one numba thread per worker.
@@ -43,6 +45,7 @@ import numba
 import numpy as np
 import scipy.sparse as sp
 from scipy import ndimage as ndi
+from scipy.sparse import csgraph
 from scipy.sparse.linalg import splu
 from skimage.morphology import skeletonize
 
@@ -184,6 +187,122 @@ def _order_cycle(H):
     return path
 
 
+def _loop_length(loop):
+    return np.linalg.norm(np.diff(np.vstack([loop, loop[:1]]), axis=0), axis=1).sum()
+
+
+_HALF = [np.array(o) - 1 for o in np.ndindex(3, 3, 3) if o > (1, 1, 1)]
+
+
+def _voxel_edges(mask):
+    """Edges (i, j, length) of the 26-neighbourhood graph of the voxels of mask, with
+    nodes numbered in np.argwhere order."""
+    index = -np.ones(mask.shape, dtype=np.int64)
+    index[mask] = np.arange(np.count_nonzero(mask))
+    ii, jj, ww = [], [], []
+    for o in _HALF:
+        a = tuple(slice(max(-d, 0), n - max(d, 0)) for d, n in zip(o, mask.shape))
+        b = tuple(slice(max(d, 0), n - max(-d, 0)) for d, n in zip(o, mask.shape))
+        i, j = index[a], index[b]
+        ok = (i >= 0) & (j >= 0)
+        ii.append(i[ok]), jj.append(j[ok]), ww.append(np.full(ok.sum(), np.linalg.norm(o)))
+    return np.concatenate(ii), np.concatenate(jj), np.concatenate(ww)
+
+
+def _graph(n, i, j, w):
+    return sp.csr_matrix((w, (i, j)), shape=(n, n))
+
+
+def tighten_loop(mask, loop, width=1, tries=8, pad=4, max_pad=32):
+    """
+    Shorter loop through mask around the same tunnel as loop (both in mask coordinates).
+
+    At a loop point p, the connected cross-section S of mask in a slab (thickness
+    2 * width + 1) normal to the loop is cut out; if the loop crosses S once, the
+    shortest path in mask - S from one side of S to the other, closed through S, is a
+    loop that crosses S once, so it goes around a tunnel as well (one of the tunnels
+    of the loop), and it hugs that tunnel. The search is restricted to the bounding box
+    of the loop, padded (up to max_pad) until S fits in, and to paths no longer than the
+    loop. Up to `tries` loop points are tried; returns the loop unchanged if none gives
+    a suitable cross-section.
+    """
+    length = _loop_length(loop)
+    for i in np.linspace(0, len(loop), tries, endpoint=False).astype(int):
+        p = loop[i]
+        tangent = (loop[(i + 2) % len(loop)] - loop[i - 2]).astype(float)
+        tangent /= np.linalg.norm(tangent)
+        q = pad
+        while True:
+            lo = np.maximum(loop.min(0) - q, 0)
+            hi = np.minimum(loop.max(0) + q + 1, mask.shape)
+            m = mask[tuple(slice(a, b) for a, b in zip(lo, hi))]
+            z, y, x = np.ogrid[tuple(slice(a - c, b - c) for a, b, c in zip(lo, hi, p))]
+            side = z * tangent[0] + y * tangent[1] + x * tangent[2]
+            comp = cc3d.connected_components((m & (np.abs(side) <= width)).view(np.uint8))
+            S = comp == comp[tuple(p - lo)]
+            fits = not _touches_faces(S, lo, hi, mask.shape)
+            if fits or q >= min(length / 2, max_pad):
+                break
+            q *= 2
+        if not fits:
+            continue
+        inside = S[tuple((loop - lo).T)]
+        if np.count_nonzero(inside != np.roll(inside, 1)) != 2:
+            continue
+        tight = _shortest_crossing(m, S, side, length)
+        if tight is not None and _loop_length(tight) < length:
+            return tight + lo
+        return loop
+    return loop
+
+
+def _shortest_crossing(m, S, side, limit):
+    """Shortest loop in m that crosses S once (a path in m - S from the + side of S to
+    the - side, closed through S), or None."""
+    pts = np.argwhere(m)
+    i, j, w = _voxel_edges(m)
+    inS = S[m]
+    near = ndi.binary_dilation(S, np.ones((3, 3, 3), bool))[m] & ~inS
+    plus = np.flatnonzero(near & (side[m] > 0))
+    minus = np.flatnonzero(near & (side[m] < 0))
+    if len(plus) == 0 or len(minus) == 0:
+        return None
+    out = ~(inS[i] | inS[j])
+    G = _graph(len(pts), i[out], j[out], w[out])
+    dist, pred, src = csgraph.dijkstra(
+        G, directed=False, indices=plus, min_only=True, return_predecessors=True, limit=limit
+    )
+    t = minus[np.argmin(dist[minus])]
+    if not np.isfinite(dist[t]):
+        return None
+    a = src[t]
+    path = [t]
+    while path[-1] != a:
+        path.append(pred[path[-1]])
+    # close the loop through S, from a to t
+    keep = inS.copy()
+    keep[[a, t]] = True
+    inner = keep[i] & keep[j]
+    G = _graph(len(pts), i[inner], j[inner], w[inner])
+    _, pred = csgraph.dijkstra(G, directed=False, indices=a, return_predecessors=True)
+    if pred[t] < 0:
+        return None
+    back = [pred[t]]
+    while back[-1] != a:
+        back.append(pred[back[-1]])
+    return pts[path + back[:-1][::-1]]
+
+
+def _touches_faces(a, lo, hi, shape):
+    """Whether a (the box lo:hi of an array of the given shape) is nonzero on a face of
+    the box that is not a face of the array."""
+    for k in range(3):
+        for e, at in ((0, lo[k] > 0), (-1, hi[k] < shape[k])):
+            if at and np.take(a, e, axis=k).any():
+                return True
+    return False
+
+
 def span_loop(loop, kmax=128):
     """Harmonic membrane spanning a closed loop; returns grid points (R+1, K, 3), row R = loop."""
     closed = np.vstack([loop, loop[:1]]).astype(float)
@@ -260,9 +379,11 @@ def _blocks(shape, core, halo):
         yield core_sl, _pad(core_sl, shape, halo)
 
 
-def _block_loops(blk, core_sl, sl, labels, nlabels, max_loop_length):
-    """Loops (global voxel coordinates) of the cells with handles in block blk = img[sl],
-    with centre in its core."""
+def _block_loops(blk, core_sl, sl, shape, labels, nlabels, max_loop_length, thickness):
+    """Loops (global voxel coordinates) of the cells with handles in block blk = img[sl]
+    (img of the given shape), with centre in its core, tightened, with their membranes
+    as (label, loop, grid, slice, mask), and the loops that are too long as (label,
+    length)."""
     t = time.time()
     present = np.intersect1d(fastremap.unique(blk), labels)
     if len(present) == 0:
@@ -277,15 +398,17 @@ def _block_loops(blk, core_sl, sl, labels, nlabels, max_loop_length):
         m = blk == lab
         bb = _pad(ndi.find_objects(m.view(np.uint8))[0], m.shape, 1)
         for loop in skeleton_loops(m[bb]):
-            loop = loop + off + [s.start for s in bb]
-            centre = (loop.min(0) + loop.max(0)) / 2
+            centre = (loop.min(0) + loop.max(0)) / 2 + off + [s.start for s in bb]
             if not np.all((centre >= lo) & (centre < hi)):
                 continue
-            length = np.linalg.norm(np.diff(np.vstack([loop, loop[:1]]), axis=0), axis=1).sum()
+            loop = tighten_loop(m[bb], loop) + off + [s.start for s in bb]
+            length = _loop_length(loop)
             if length > max_loop_length:
                 skipped.append((int(lab), round(length)))
                 continue
-            loops.append((int(lab), loop))
+            grid = span_loop(loop)
+            gsl, box = voxelize_membrane(grid, shape, thickness)
+            loops.append((int(lab), loop, grid, gsl, box))
     return loops, skipped, time.time() - t
 
 
@@ -400,6 +523,17 @@ def _overlap(a, b):
     return all(x.start < y.stop and y.start < x.stop for x, y in zip(a, b))
 
 
+def _shared(sa, a, sb, b):
+    """Number of voxels in both masks a at slice sa and b at slice sb."""
+    lo = [max(x.start, y.start) for x, y in zip(sa, sb)]
+    hi = [min(x.stop, y.stop) for x, y in zip(sa, sb)]
+    if any(b_ <= a_ for a_, b_ in zip(lo, hi)):
+        return 0
+    ca = tuple(slice(a_ - x.start, b_ - x.start) for a_, b_, x in zip(lo, hi, sa))
+    cb = tuple(slice(a_ - y.start, b_ - y.start) for a_, b_, y in zip(lo, hi, sb))
+    return int(np.count_nonzero(a[ca] & b[cb]))
+
+
 def _bounded_map(ex, fn, jobs, workers):
     """ex.map(fn, *zip(*jobs)) with at most 2 * workers jobs (window copies) in flight;
     serial without ex."""
@@ -419,9 +553,9 @@ def _pass(ex, img, nlabels, fills, core, max_len, max_loop_length, regions, know
     """One pass with windows of core size `core` (halo core / 2), restricted to windows
     overlapping `regions` (if given) and to cells with more handles than `known`
     (label -> number of loops known to be too long); fills the loops up to max_len.
-    Returns the slices of the applied membranes and the labels of the handles left
-    unresolved (too long, or the membrane would create handles), or None if no cell
-    has handles."""
+    Returns the slices of the applied membranes, the labels of the handles left
+    unresolved (too long, or the membrane would create handles) and
+    the number of loops dropped as duplicates, or None if no cell has handles."""
     t = time.time()
     halo = core // 2
     h = handle_counts(img, nlabels)
@@ -441,7 +575,10 @@ def _pass(ex, img, nlabels, fills, core, max_len, max_loop_length, regions, know
         _bounded_map(
             ex,
             _block_loops,
-            ((img[sl], c, sl, labels, nlabels, max_len) for c, sl in jobs),
+            (
+                (img[sl], c, sl, img.shape, labels, nlabels, max_len, kw["thickness"])
+                for c, sl in jobs
+            ),
             workers,
         )
     )
@@ -449,10 +586,13 @@ def _pass(ex, img, nlabels, fills, core, max_len, max_loop_length, regions, know
     too_long = sorted(s for res in results for s in res[1] if s[1] > max_loop_length)
     t_loops = time.time() - t - t_check
     t = time.time()
-    touched, rejected, cuts, unresolved = [], 0, 0, []
-    for lab, loop in loops:
-        grid = span_loop(loop)
-        gsl, box = voxelize_membrane(grid, img.shape, kw["thickness"])
+    touched, rejected, cuts, duplicates, unresolved = [], 0, 0, 0, []
+    applied = {}  # label -> membranes applied in this pass
+    for lab, loop, grid, gsl, box in loops:
+        # two loops can be tightened around the same tunnel
+        if any(_shared(gsl, box, g, b) > box.sum() / 2 for g, b in applied.get(lab, [])):
+            duplicates += 1
+            continue
         taken = _apply_membrane(img, lab, gsl, box)
         if not isinstance(taken, Counter):
             if taken < 0:  # the membrane would create handles: cut the handle instead
@@ -465,6 +605,7 @@ def _pass(ex, img, nlabels, fills, core, max_len, max_loop_length, regions, know
                 unresolved.append(lab)
             rejected += 1
             continue
+        applied.setdefault(lab, []).append((gsl, box))
         if kw["fillet_radius"]:
             taken["fillet"] = _fillet(img, lab, gsl, box, kw["fillet_radius"])
         taken["separated"] = _separate(img, lab, gsl, kw["fillet_radius"] + 3)
@@ -480,9 +621,11 @@ def _pass(ex, img, nlabels, fills, core, max_len, max_loop_length, regions, know
         f"{len(jobs)} windows, {len(loops)} loops ({t_loops:.1f}s wall, "
         f"{sum(r[2] for r in results):.1f}s in workers), applied {len(touched) - cuts}, "
         f"cut {cuts}, rejected {rejected}, {cavities} enclosed voxels filled "
-        f"({time.time() - t:.1f}s)" + (f", too long: {too_long}" if too_long else "")
+        f"({time.time() - t:.1f}s)"
+        + (f", duplicates {duplicates}" if duplicates else "")
+        + (f", too long: {too_long}" if too_long else "")
     )
-    return touched, [lab for lab, _ in too_long] + unresolved
+    return touched, [lab for lab, _ in too_long] + unresolved, duplicates
 
 
 def fill_handles(
@@ -537,6 +680,16 @@ def fill_handles(
         res = None
         for core in cores:
             res = run(core, None, {})
+            # a loop tightened around a tunnel that was filled already leaves another
+            # tunnel of the cell; look for it around the new membranes at this scale
+            for _ in range(cleanup_rounds):
+                if res is None or not res[2]:
+                    break
+                more = run(core, res[0], Counter(res[1]))
+                if more is None:
+                    break
+                left = Counter(res[1]) | Counter(more[1])  # both report the same loops
+                res = (res[0] + more[0], list(left.elements()), more[2])
             if res is None:
                 break
         # membranes of earlier scales are covered by the next scale; clean up after the
