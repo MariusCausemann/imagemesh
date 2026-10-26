@@ -9,7 +9,10 @@ from imagemesh.curved import (
     compute_quadratic_quality,
     convert_to_quadratic,
     print_quality_stats,
+    quadratic_tet_volumes,
+    quadratic_triangle_areas,
 )
+from imagemesh.tetmesh import compute_surface_volume
 
 # ---------- helpers ----------------------------------------------------------
 
@@ -148,6 +151,44 @@ def test_quality_chooses_shortest_octahedron_diagonal():
 
     # All three slicings should remain valid (positive quality).
     assert all(q > 0 for q in qualities), qualities
+
+
+# ---------- exact volumes and areas -------------------------------------------
+
+
+def _stretched(points, a):
+    """The quadratic map (x, y, z) -> (x + a x^2, y, z), reproduced exactly by P2."""
+    points = np.array(points, dtype=float)
+    points[:, 0] += a * points[:, 0] ** 2
+    return points
+
+
+def test_quadratic_tet_volume_is_exact():
+    """detJ = 1 + 2 a x, so the volume of the stretched unit tet is 1/6 + a/12."""
+    quad = _unit_quadratic_tet()
+    quad.points = _stretched(quad.points, 0.5)
+    cells = quad.cells.reshape(-1, 11)[:, 1:]
+    np.testing.assert_allclose(quadratic_tet_volumes(quad.points, cells), [1 / 6 + 0.5 / 12])
+
+    quad.cell_data["label"] = [3]
+    volumes, areas = compute_surface_volume(quad, [3])
+    np.testing.assert_allclose(volumes, [1 / 6 + 0.5 / 12])
+
+
+def test_quadratic_triangle_area_is_exact():
+    """The stretched face z = 0 has the area element 1 + 2 a x: area 1/2 + a/3."""
+    points = _unit_quadratic_tet().points[[0, 1, 2, 4, 5, 6]]
+    area = quadratic_triangle_areas(_stretched(points, 0.5), np.arange(6)[None])
+    np.testing.assert_allclose(area, [0.5 + 0.5 / 3])
+
+
+def test_compute_surface_volume_straight_quadratic_tet():
+    """A straight-sided quadratic tet has the volume and area of the linear one."""
+    quad = _unit_quadratic_tet()
+    quad.cell_data["label"] = [1]
+    volumes, areas = compute_surface_volume(quad, [1])
+    np.testing.assert_allclose(volumes, [1 / 6])
+    np.testing.assert_allclose(areas, [1.5 + np.sqrt(3) / 2])
 
 
 # ---------- print_quality_stats ----------------------------------------------

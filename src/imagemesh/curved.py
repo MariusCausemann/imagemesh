@@ -87,6 +87,56 @@ QUALITY_POINTS = [
 MIDSIDE_EDGES = [(4, 0, 1), (5, 1, 2), (6, 0, 2), (7, 0, 3), (8, 1, 3), (9, 2, 3)]
 
 
+def simplex_quadrature(dim, n):
+    """Collapsed Gauss-Legendre rule with n points per direction on the reference
+    triangle (dim 2) or tet (dim 3). Exact for polynomials of degree 2n - dim.
+
+    Returns ``(points, weights)`` with points of shape (n**dim, dim).
+    """
+    x, w = np.polynomial.legendre.leggauss(n)
+    x, w = 0.5 * (x + 1), 0.5 * w
+    grid = np.stack(np.meshgrid(*[x] * dim, indexing="ij"), -1).reshape(-1, dim)
+    weights = np.prod(np.stack(np.meshgrid(*[w] * dim, indexing="ij"), -1), -1).ravel()
+    points = np.empty_like(grid)
+    scale = np.ones(len(grid))
+    for d in range(dim):
+        points[:, d] = grid[:, d] * scale
+        scale = scale * (1 - grid[:, d])
+        weights *= (1 - grid[:, d]) ** (dim - 1 - d)
+    return points, weights
+
+
+def eval_triangle_shape_gradients(u, v):
+    """Derivatives of the 6-node triangle shape functions (VTK order: corners
+    0, 1, 2, then edges 0-1, 1-2, 2-0) with respect to (u, v). Shape (6, 2)."""
+    L0 = 1.0 - u - v
+    dN_du = [1 - 4 * L0, 4 * u - 1, 0, 4 * (L0 - u), 4 * v, -4 * v]
+    dN_dv = [1 - 4 * L0, 0, 4 * v - 1, -4 * u, 4 * u, 4 * (L0 - v)]
+    return np.column_stack([dN_du, dN_dv])
+
+
+def quadratic_tet_volumes(points, cells):
+    """Exact volumes of the 10-node tets ``cells`` (N, 10): detJ is cubic, so a
+    degree 3 rule integrates it exactly."""
+    X = np.asarray(points, dtype=np.float64)[cells]
+    vol = np.zeros(len(cells))
+    for p, w in zip(*simplex_quadrature(3, 3)):
+        J = np.einsum("nik,ij->nkj", X, eval_shape_gradients(*p))
+        vol += w * np.linalg.det(J)
+    return np.abs(vol)
+
+
+def quadratic_triangle_areas(points, faces, n=5):
+    """Areas of the 6-node triangles ``faces`` (N, 6), integrated with ``n``
+    points per direction (the area element of a curved face is not polynomial)."""
+    X = np.asarray(points, dtype=np.float64)[faces]
+    area = np.zeros(len(faces))
+    for p, w in zip(*simplex_quadrature(2, n)):
+        J = np.einsum("nik,ij->nkj", X, eval_triangle_shape_gradients(*p))
+        area += w * np.linalg.norm(np.cross(J[:, :, 0], J[:, :, 1]), axis=1)
+    return area
+
+
 def compute_quadratic_quality(mesh):
     """
     Computes the minimum exact Jacobian determinant for every 2nd-order

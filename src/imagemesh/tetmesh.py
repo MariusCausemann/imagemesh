@@ -13,7 +13,8 @@ import pyvista as pv
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
-from imagemesh.facets import _raw_faces
+from imagemesh.curved import quadratic_tet_volumes, quadratic_triangle_areas
+from imagemesh.facets import _raw_faces, _tet_face_topology
 from imagemesh.simplification import simplify_surface
 from imagemesh.winding_number import label_points
 
@@ -79,7 +80,13 @@ def mesh_surface(surf, envelopsize=None, simplify_eps=None, label_name="label", 
 
 
 def compute_surface_volume(mesh, labels, label_array="label"):
-    """Volume and surface area of the regions of mesh with the given labels."""
+    """
+    Volume and surface area of the regions of mesh with the given labels. For
+    quadratic tets both are integrated over the curved cells and faces (VTK's
+    cell sizes only see their straight sub-cells).
+    """
+    if pv.CellType.QUADRATIC_TETRA in mesh.cells_dict:
+        return _quadratic_surface_volume(mesh, labels, label_array)
     mesh = mesh.compute_cell_sizes()
     mesh["Volume"] = np.abs(mesh["Volume"])
     assert (mesh["Volume"] > 0).all()
@@ -89,6 +96,22 @@ def compute_surface_volume(mesh, labels, label_array="label"):
         surf = cell.extract_surface()
         surface_areas.append(float(surf.compute_cell_sizes()["Area"].sum()))
         volumes.append(float(cell["Volume"].sum()))
+    return volumes, surface_areas
+
+
+def _quadratic_surface_volume(mesh, labels, label_array):
+    cells = mesh.cells_dict[pv.CellType.QUADRATIC_TETRA]
+    if len(cells) != mesh.n_cells:
+        raise ValueError("mixed meshes of quadratic tets and other cells are not supported")
+    volume = quadratic_tet_volumes(mesh.points, cells)
+    markers = np.asarray(mesh.cell_data[label_array])
+    volumes, surface_areas = [], []
+    for label in labels:
+        sel = markers == label
+        sub = mesh.extract_cells(sel)
+        faces = _tet_face_topology(sub)["boundary_faces"]
+        surface_areas.append(float(quadratic_triangle_areas(sub.points, faces).sum()))
+        volumes.append(float(volume[sel].sum()))
     return volumes, surface_areas
 
 
