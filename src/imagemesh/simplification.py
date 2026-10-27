@@ -25,6 +25,12 @@ a parallel numba kernel on plain face arrays:
   the vertices, midpoints of the new edges) are within epsilon of the
   input faces (of the same label pair) whose centroids were owned by the faces
   around u.
+* feature curves: as curve vertices only collapse along their curve, each
+  output curve edge replaces a chain of input curve edges. A collapse is only
+  accepted if the new curve edges and the chains they replace are within
+  epsilon of each other (both ways), and if the merged curve edge keeps the
+  label pairs of the faces around it, so no patch vanishes at a junction.
+  Corners never move.
 * orientation: normals are compared oriented by the label order (flipped if
   label[0] > label[1]), and the sample points of the modified faces must be
   within epsilon of an input face whose oriented normal is less than 90
@@ -290,8 +296,8 @@ def _classify(F, vf_ptr, vf_idx, feature_degree):
     return cls
 
 
-def _feature_degree(F, patch, nv):
-    """Number of feature edges (valence != 2 or different label pairs) per vertex."""
+def _feature_edges(F, patch, nv):
+    """Feature edges (valence != 2 or different label pairs), (n, 2) sorted."""
     e = np.sort(np.stack([F, np.roll(F, -1, axis=1)], axis=-1).reshape(-1, 2), axis=1)
     key = e[:, 0] * nv + e[:, 1]
     ukey, inv, valence = np.unique(key, return_inverse=True, return_counts=True)
@@ -301,7 +307,28 @@ def _feature_degree(F, patch, nv):
     np.minimum.at(pmin, inv, fpatch)
     np.maximum.at(pmax, inv, fpatch)
     feat = ukey[(valence != 2) | (pmin != pmax)]
-    return np.bincount(feat // nv, minlength=nv) + np.bincount(feat % nv, minlength=nv)
+    return np.stack([feat // nv, feat % nv], axis=1)
+
+
+def _feature_degree(F, patch, nv):
+    """Number of feature edges (valence != 2 or different label pairs) per vertex."""
+    return np.bincount(_feature_edges(F, patch, nv).ravel(), minlength=nv)
+
+
+def _feature_neighbours(E, nv):
+    """The two feature neighbours of the vertices with two feature edges, else -1."""
+    deg = np.bincount(E.ravel(), minlength=nv)
+    nbr = np.full((nv, 2), -1, np.int64)
+    a = np.concatenate([E[:, 0], E[:, 1]])
+    b = np.concatenate([E[:, 1], E[:, 0]])
+    o = np.argsort(a, kind="stable")
+    a, b = a[o], b[o]
+    first = np.ones(len(a), bool)
+    first[1:] = a[1:] != a[:-1]
+    two = deg[a] == 2
+    nbr[a[two & first], 0] = b[two & first]
+    nbr[a[two & ~first], 1] = b[two & ~first]
+    return nbr
 
 
 def _patches(labels):
@@ -402,6 +429,75 @@ def _sample_points(V, F, patch, sgn, cls, vf_ptr, vf_idx, gin, centroids):
 
 
 @nb.njit(cache=True)
+def _seg_sqdist(q, A, B):
+    """Squared distance of point q to the segment (A, B)."""
+    ex, ey, ez = B[0] - A[0], B[1] - A[1], B[2] - A[2]
+    qx, qy, qz = q[0] - A[0], q[1] - A[1], q[2] - A[2]
+    ee = ex * ex + ey * ey + ez * ez
+    t = 0.0 if ee == 0.0 else min(max((qx * ex + qy * ey + qz * ez) / ee, 0.0), 1.0)
+    qx, qy, qz = qx - t * ex, qy - t * ey, qz - t * ez
+    return qx * qx + qy * qy + qz * qz
+
+
+@nb.njit(cache=True)
+def _curve_end(x, k, fnbr, vf_ptr):
+    """
+    The next live vertex on the input feature curve from x in direction
+    fnbr[x, k] (removed vertices have no faces), -1 if there is none.
+    """
+    prev, cur = x, fnbr[x, k]
+    for _ in range(len(fnbr)):
+        if cur < 0:
+            return -1
+        if vf_ptr[cur + 1] > vf_ptr[cur]:
+            return cur
+        a = fnbr[cur, 0]
+        prev, cur = cur, (a if a != prev else fnbr[cur, 1])
+    return -1
+
+
+@nb.njit(cache=True)
+def _chain_ok(x, k0, k1, A, B, Vin, fnbr, vf_ptr, eps2):
+    """
+    True if the input feature curve through x, in the directions fnbr[x, k0:k1]
+    up to the next live vertices (which must exist), and the segment (A, B)
+    replacing it are within eps of each other (Hausdorff).
+    """
+    if _seg_sqdist(Vin[x], A, B) > eps2:
+        return False
+    ne = 0
+    for k in range(k0, k1):
+        prev, cur = x, fnbr[x, k]
+        while True:
+            ne += 1
+            if _seg_sqdist(Vin[cur], A, B) > eps2:
+                return False
+            if vf_ptr[cur + 1] > vf_ptr[cur]:
+                break
+            a = fnbr[cur, 0]
+            prev, cur = cur, (a if a != prev else fnbr[cur, 1])
+    # samples of the segment, twice as dense as the input edges
+    ns = 2 * ne
+    q = np.empty(3)
+    for i in range(ns + 1):
+        t = i / ns
+        for d in range(3):
+            q[d] = A[d] + t * (B[d] - A[d])
+        ok = False
+        for k in range(k0, k1):
+            prev, cur = x, fnbr[x, k]
+            while not ok:
+                ok = _seg_sqdist(q, Vin[prev], Vin[cur]) <= eps2
+                if vf_ptr[cur + 1] > vf_ptr[cur]:
+                    break
+                a = fnbr[cur, 0]
+                prev, cur = cur, (a if a != prev else fnbr[cur, 1])
+        if not ok:
+            return False
+    return True
+
+
+@nb.njit(cache=True)
 def _check_collapse(
     u,
     v,
@@ -424,6 +520,7 @@ def _check_collapse(
     gin,
     cls,
     planes,
+    fnbr,
     eps2,
     cos_max,
     q_min,
@@ -466,6 +563,24 @@ def _check_collapse(
         feature = True
     if (cls[u] == CURVE) != feature:
         return False
+
+    # deviation along feature curves, both ways: the input curve between the
+    # live neighbours w and v of u (and with a moved v, between v and its other
+    # live neighbour z) must be within eps of the new curve edges
+    w = -1
+    if cls[u] == CURVE:
+        e0 = _curve_end(u, 0, fnbr, vf_ptr)
+        e1 = _curve_end(u, 1, fnbr, vf_ptr)
+        if e0 < 0 or e1 < 0 or e0 == e1 or (e0 != v and e1 != v):
+            return False
+        w = e1 if e0 == v else e0
+        if not _chain_ok(u, 0, 2, V[w], p, Vin, fnbr, vf_ptr, eps2):
+            return False
+        if moved and fnbr[v, 0] >= 0:
+            k = 1 if _curve_end(v, 0, fnbr, vf_ptr) == u else 0
+            z = _curve_end(v, k, fnbr, vf_ptr)
+            if z < 0 or not _chain_ok(v, k, k + 1, p, V[z], Vin, fnbr, vf_ptr, eps2):
+                return False
 
     # link condition: common neighbours of u and v are the opposite vertices
     for i in range(nu):
@@ -511,6 +626,25 @@ def _check_collapse(
         k += 1
     # the faces whose geometry changes: with a moved v also the unchanged ones
     k0 = 0 if moved else n_unchanged
+
+    # the merged curve edge (w, v) keeps the label pairs of the faces around
+    # (u, v), so no patch vanishes at the curve
+    if w >= 0:
+        used = shared.copy()  # the faces on (u, v) not matched yet
+        for k in range(m):
+            if w != nf_tri[k, 0] and w != nf_tri[k, 1] and w != nf_tri[k, 2]:
+                continue
+            found = False
+            for i in range(nu):
+                if used[i] and patch[ru[i]] == patch[nf_id[k]]:
+                    used[i] = False
+                    found = True
+                    break
+            if not found:
+                return False
+        for i in range(nu):
+            if used[i]:
+                return False
 
     # no duplicate faces
     for k in range(n_unchanged, m):
@@ -905,6 +1039,7 @@ def _propose(
     gin,
     cls,
     planes,
+    fnbr,
     Q,
     dirty,
     qem,
@@ -990,6 +1125,7 @@ def _propose(
                 gin,
                 cls,
                 planes,
+                fnbr,
                 eps2,
                 cos_max,
                 q_min,
@@ -1051,6 +1187,7 @@ def _apply(
     gin,
     cls,
     planes,
+    fnbr,
     Q,
     eps2,
     cos_max,
@@ -1084,6 +1221,7 @@ def _apply(
             gin,
             cls,
             planes,
+            fnbr,
             eps2,
             cos_max,
             q_min,
@@ -1322,7 +1460,9 @@ def simplify_surface(
     patch = _patches(labels)
 
     vf_ptr, vf_idx = _vertex_faces(F, nv)
-    cls = _classify(F, vf_ptr, vf_idx, _feature_degree(F, patch, nv))
+    E = _feature_edges(F, patch, nv)
+    cls = _classify(F, vf_ptr, vf_idx, np.bincount(E.ravel(), minlength=nv))
+    fnbr = _feature_neighbours(E, nv)
     if fixed is not None:
         cls[np.asarray(fixed, dtype=bool)] = CORNER
     diag = np.linalg.norm(np.ptp(V, axis=0))
@@ -1383,6 +1523,7 @@ def simplify_surface(
             gin,
             cls,
             planes,
+            fnbr,
         )
         # dynamic scheduling, the work per vertex varies a lot
         with nb.parallel_chunksize(16):
