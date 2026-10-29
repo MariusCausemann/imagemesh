@@ -1,7 +1,6 @@
 """
 Synthetic cases where surface_quads and contour_labels differ: the voxels,
-contour_labels as it is, with close_quad_holes, and surface_quads, each after
-a little smoothing.
+contour_labels and surface_quads, each after a little smoothing.
 
     python plot_synth.py OUT.png
 """
@@ -20,7 +19,7 @@ from scipy.sparse.csgraph import connected_components  # noqa: E402
 
 from imagemesh.image import np2pv  # noqa: E402
 from imagemesh.smoothing import smooth_surface_net  # noqa: E402
-from imagemesh.surface import close_quad_holes, surface_quads  # noqa: E402
+from imagemesh.surface import surface_quads  # noqa: E402
 
 warnings.simplefilter("ignore")
 ITER = 4
@@ -41,7 +40,7 @@ def shaded(polys, colours):
 
 
 VIEW = (24, -52)
-RED, ORANGE, VIOLET, INK, MUTED = "#e34948", "#eda100", "#6250d6", "#1f1f1e", "#8a8a85"
+RED, INK, MUTED = "#e34948", "#1f1f1e", "#8a8a85"
 
 
 def flap_case():
@@ -49,16 +48,14 @@ def flap_case():
     img[0, 0, 0] = img[1, 0, 0] = img[0, 1, 0] = 1  # an L in the bottom layer
     img[1, 1, 1] = 1  # above its inner corner: touches two of them along edges, one at a corner
     return (
-        "Flap: VTK leaves a slit, its cap duplicates a triangle",
+        "Flap: VTK leaves a slit",
         img,
         1,
         "Three voxels of 1 form an L; a fourth sits above its inner corner. contour_labels "
         "splits that corner\n"
-        "inconsistently and leaves a slit (black); close_quad_holes caps it with a zero-area "
-        "quad (violet)\n"
-        "whose triangulation repeats a neighbour (red). surface_quads has no slit; here label 2 "
-        "keeps its\n"
-        "diagonal at the edge under the fourth voxel, so 1 is two pieces touching at a corner.",
+        "inconsistently and leaves a slit (black). surface_quads has no slit; here label 2 keeps "
+        "its diagonal at the\n"
+        "edge under the fourth voxel, so 1 is two pieces touching at a corner.",
         None,
         2,
         None,
@@ -99,7 +96,7 @@ def pinch_case():
         "The neck of 1 would need a vertex in the middle of the edge (a lens); a single voxel "
         "edge has\n"
         "none, and both of its corners are held together by label 4's floor / ceiling. Same in "
-        "all three.",
+        "both.",
         ((0, 0, 1), (2, 2, 2)),
         4,
         None,
@@ -115,16 +112,10 @@ def surfaces(img):
         background_value=0,
         scalars="data",
     )
-    capped = close_quad_holes(raw)
-    ncap = capped.n_cells - raw.n_cells
-    out = []
-    for q, nc in ((raw, 0), (capped, ncap), (surface_quads(grid), 0)):
-        s = smooth_surface_net(q, iterations=ITER, distance=1.0, scale=1.2, fix_bounds=True)
-        cap = np.zeros(s.n_cells, bool)
-        if nc:
-            cap[-2 * nc :] = True
-        out.append((s, cap, nc))
-    return out
+    return [
+        smooth_surface_net(q, iterations=ITER, distance=1.0, scale=1.2, fix_bounds=True)
+        for q in (raw, surface_quads(grid))
+    ]
 
 
 def label_stats(tris, label_rows):
@@ -267,7 +258,7 @@ def setup(ax, lo, hi):
     ax.set_axis_off()
 
 
-def draw_surface(ax, surf, cap, label, img, box):
+def draw_surface(ax, surf, label, img, box):
     P = np.asarray(surf.points)
     T = surf.regular_faces
     bl = np.asarray(surf["boundary_labels"]).astype(int)
@@ -283,24 +274,18 @@ def draw_surface(ax, surf, cap, label, img, box):
     base = np.array(matplotlib.colors.to_rgb(LABEL_COLOUR[label]))
     shades = [base, 0.45 * base + 0.55, 0.55 * base, 0.7 * base + 0.3, 0.75 * base]
     polys = P[T[shown]]
-    fc = [VIOLET if cap[i] else shades[rowpiece[i] % len(shades)] for i in np.where(shown)[0]]
+    fc = [shades[rowpiece[i] % len(shades)] for i in np.where(shown)[0]]
     ax.add_collection3d(
         Poly3DCollection(
             polys, facecolors=shaded(polys, fc), edgecolors=(0.1, 0.1, 0.1, 0.35), linewidths=0.3
         )
     )
     voxel_outlines(ax, img, label, box)
-    s = np.sort(T, axis=1)
-    _, inv, cnt = np.unique(s, axis=0, return_inverse=True, return_counts=True)
-    dup = np.where((cnt[inv.ravel()] > 1) & rows)[0]
-    shown_dup = np.where((cnt[inv.ravel()] > 1) & shown)[0]
-    if len(shown_dup):
-        ax.add_collection3d(Poly3DCollection(P[T[shown_dup]], facecolors=RED, edgecolors=RED))
     for edges, col in ((opened, INK), (pinched, RED)):
         if len(edges):
             ax.add_collection3d(Line3DCollection(P[edges], colors=col, linewidths=3))
     setup(ax, lo, hi)
-    return pieces, len(opened), len(pinched), len(dup) // 2
+    return pieces, len(opened), len(pinched)
 
 
 def slice_regions(surf, z, lo, hi, n=400):
@@ -404,11 +389,10 @@ def main(out):
     cols = [
         "voxels",
         "contour_labels",
-        "contour_labels + close_quad_holes",
         "surface_quads",
     ]
     # explicit layout in inches: header (title + note), panel titles, panels, panel captions
-    W, PANEL, CAPTION, GAP = 13.0, 2.9, 1.0, 0.2
+    W, PANEL, CAPTION, GAP = 10.0, 2.9, 1.0, 0.2
     heads = [0.55 + 0.17 * (note.count("\n") + 1) for _, _, _, note, _, _, _ in cases]
     views = [(24, -52), (30, 45), (24, -52)]
     H = sum(heads) + len(cases) * (PANEL + CAPTION + GAP) + 0.45
@@ -423,10 +407,10 @@ def main(out):
         if box is None:  # the named label's voxels
             ijk = np.argwhere(img == label)
             box = (ijk.min(axis=0), ijk.max(axis=0) + 1)
-        for j in range(4):
+        for j in range(3):
             if plane is not None:  # the plane z = plane, from above
                 side = PANEL - 0.25
-                ax = fig.add_axes((0.005 + j / 4 + 0.02, (y + 0.1) / H, side / W, side / H))
+                ax = fig.add_axes((0.005 + j / 3 + 0.02, (y + 0.1) / H, side / W, side / H))
                 ax.set_title(cols[j], fontsize=9, color=INK, loc="left", pad=4)
                 if j == 0:
                     draw_voxel_plane(ax, img, plane)
@@ -440,7 +424,7 @@ def main(out):
                         va="top",
                     )
                     continue
-                pieces, npinch = draw_surface_plane(ax, surfs[j - 1][0], plane, label)
+                pieces, npinch = draw_surface_plane(ax, surfs[j - 1], plane, label)
                 lines = [
                     (
                         MUTED,
@@ -461,13 +445,12 @@ def main(out):
                         va="top",
                     )
                 continue
-            ax = fig.add_axes((0.005 + j / 4, y / H, 0.24, PANEL / H), projection="3d")
+            ax = fig.add_axes((0.005 + j / 3, y / H, 1 / 3 - 0.01, PANEL / H), projection="3d")
             ax.set_title(cols[j], fontsize=9, color=INK, loc="left", pad=2)
             if j == 0:
                 draw_voxels(ax, img, box, fill)
                 continue
-            s, cap, ncap = surfs[j - 1]
-            pieces, nopen, npinch, ndup = draw_surface(ax, s, cap, label, img, box)
+            pieces, nopen, npinch = draw_surface(ax, surfs[j - 1], label, img, box)
             lines = [
                 (
                     MUTED,
@@ -476,14 +459,12 @@ def main(out):
                 )
             ]
             for n, col, what in (
-                (ncap, VIOLET, "\u25a0 {} cap quad{}: zero area, close the slit"),
                 (nopen, INK, "\u2501 {} open edge{}: rim of a slit (hole)"),
                 (
                     npinch,
                     RED,
                     "\u2501 {} pinched edge{}: 4 faces of the label share it",
                 ),
-                (ndup, RED, "\u25a0 {} triangle{} stored twice, opposite orientation"),
             ):
                 if n:
                     lines.append((col, what.format(n, "s" * (n != 1))))
@@ -503,8 +484,7 @@ def main(out):
         0.05 / H,
         f"Surfaces: the named label's faces after {ITER} smoothing iterations, at their real "
         "positions; grey lines: its voxels. A piece = faces joined across manifold edges; pieces "
-        "that touch only "
-        "at a pinched edge or a corner are separate pieces.",
+        "that touch only\nat a pinched edge or a corner are separate pieces.",
         fontsize=8,
         color=MUTED,
         va="bottom",

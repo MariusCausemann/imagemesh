@@ -5,7 +5,6 @@ import pytest
 
 from imagemesh.image import np2pv
 from imagemesh.surface import (
-    close_quad_holes,
     extract_surface,
     label_volumes,
     self_intersections,
@@ -95,27 +94,6 @@ def open_edges(faces):
     a, b = faces.ravel(), np.roll(faces, -1, axis=1).ravel()
     n = faces.max() + 1
     return ~np.isin(b * n + a, a * n + b)
-
-
-def test_close_quad_holes():
-    # a 3^3 block for which vtkSurfaceNets3D drops one quad between labels 1 and 2
-    img = np.full((3, 3, 3), 2, dtype=np.uint32)
-    for p in [(0, 2, 2), (1, 0, 0), (1, 0, 1), (2, 0, 0), (2, 1, 1), (2, 2, 2)]:
-        img[p] = 1
-    surf = np2pv(img, (DX,) * 3).contour_labels(
-        "all", smoothing=False, output_mesh_type="quads", background_value=0, scalars="data"
-    )
-    if not open_edges(surf.regular_faces).any():
-        pytest.skip("this VTK version leaves no hole")
-    assert open_edges(surf.regular_faces).sum() == 4
-
-    closed = close_quad_holes(surf)
-    assert closed.n_cells == surf.n_cells + 1
-    assert not open_edges(closed.regular_faces).any()
-    assert np.array_equal(closed.regular_faces[:-1], surf.regular_faces)
-    assert sorted(closed["boundary_labels"][-1]) == [1, 2]
-    # nothing to close
-    assert close_quad_holes(closed) is closed
 
 
 def label_surface(surf, label):
@@ -208,7 +186,7 @@ def test_surface_quads_direction(flip):
 
 
 def test_surface_quads_no_slit():
-    # the 3^3 block where vtkSurfaceNets3D leaves a slit (test_close_quad_holes)
+    # a 3^3 block for which vtkSurfaceNets3D drops one quad between labels 1 and 2
     img = np.full((3, 3, 3), 2)
     for p in [(0, 2, 2), (1, 0, 0), (1, 0, 1), (2, 0, 0), (2, 1, 1), (2, 2, 2)]:
         img[p] = 1
