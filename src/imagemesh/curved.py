@@ -1,13 +1,13 @@
 import numpy as np
 import pyvista as pv
-import vtk
+from vtkmodules.vtkFiltersGeometry import vtkLinearToQuadraticCellsFilter
 
 from .facets import _tet_face_topology
 
 
 def convert_to_quadratic(tet_mesh: pv.UnstructuredGrid) -> pv.UnstructuredGrid:
     """Converts a linear tetrahedral mesh to a quadratic tetrahedral mesh."""
-    filter_quad = vtk.vtkLinearToQuadraticCellsFilter()
+    filter_quad = vtkLinearToQuadraticCellsFilter()
     filter_quad.SetInputData(tet_mesh)
     filter_quad.Update()
     return pv.wrap(filter_quad.GetOutput())
@@ -451,7 +451,7 @@ def straighten_inverted_cells(
 def print_quality_stats(mesh: pv.UnstructuredGrid, mesh_name: str):
     """Computes and prints the Scaled Jacobian quality of the mesh."""
 
-    if mesh.celltypes[0] == vtk.VTK_QUADRATIC_TETRA:
+    if mesh.celltypes[0] == pv.CellType.QUADRATIC_TETRA:
         q_arr = compute_quadratic_quality(mesh)
 
     else:
