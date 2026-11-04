@@ -72,6 +72,11 @@ def zero_edges(img):
     return img
 
 
+def prune_tips(img, iterations=1):
+    print(f"prune_tips,  ({img.shape})")
+    return nbmorph.prune_tips(img, iterations=iterations)
+
+
 def upsample(img, factor):
     return zoom(img, factor, order=0)
 

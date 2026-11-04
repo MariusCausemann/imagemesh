@@ -5,7 +5,7 @@ Tetrahedral meshes of multi-label images. Shared meshing core of
 [brainmesh](https://github.com/MariusCausemann/brainmesh).
 
 ```
-label image ──► surface nets + constrained smoothing   imagemesh.surface.extract_surface
+label image ──► surface nets + smoothing or fairing    imagemesh.surface.extract_surface
             ──► feature/label preserving simplification imagemesh.simplification.simplify_surface
             ──► fTetWild + winding-number labelling     imagemesh.tetmesh.mesh_surface
             ──► interface / boundary facet tags         imagemesh.facets
@@ -21,7 +21,7 @@ downstream packages.
 | `morphology` | label-image morphology and voxel helpers |
 | `pinches`, `handles` | topology repair of label images before surface nets |
 | `gaussian` | parallel recursive Gaussian filter |
-| `surface`, `smoothing` | multi-label surface extraction, label volumes, self-intersections |
+| `surface`, `smoothing`, `fairing` | multi-label surface extraction, Laplacian smoothing and fairing, label volumes, self-intersections |
 | `simplification` | parallel QEM edge-collapse simplification with bounded deviation |
 | `winding_number` | fast (multi-label) generalized winding numbers |
 | `tetmesh` | fTetWild meshing, tet labelling, tet mesh utilities |

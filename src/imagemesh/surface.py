@@ -15,16 +15,29 @@ from imagemesh.smoothing import smooth_surface_net
 
 
 def extract_surface(
-    grid, smoothing_scale=1.2, iterations=16, scalars="data", background_value=0, degenerate=None
+    grid,
+    smoothing_scale=1.2,
+    iterations=None,
+    scalars="data",
+    background_value=0,
+    degenerate=None,
+    method="laplace",
+    **fair_kwargs,
 ):
     """
     Smoothed, triangulated multi-label surface of the label image grid
     (pv.ImageData with the labels as cell data `scalars`), with cell data
-    'boundary_labels' (n_faces, 2): surface nets (contour_labels without
-    smoothing) followed by a constrained smoothing that keeps the points on
-    the bounding box on their box face.
-    The displacement of each point is limited to smoothing_scale * dx; dx is
-    stored in the field data.
+    'boundary_labels' (n_faces, 2): surface nets (surface_quads) followed by a
+    smoothing that keeps the points on the bounding box on their box face.
+    dx is stored in the field data.
+
+    method="laplace": constrained Laplacian smoothing as in VTK's
+    contour_labels (iterations defaults to 16); the displacement of each
+    point is limited to smoothing_scale * dx.
+    method="fair": volume-preserving fairing bounded by the voxel surface,
+    imagemesh.fairing.fair_surface_net (iterations defaults to 40); fair_kwargs
+    (alpha, dead_zone, max_distance, volume, ...) are passed on.
+
     degenerate: build_stencils' treatment of quads whose opposite corners have
     nested junction stencils. None (VTK) keeps junction curves smoothed as
     curves; "full" un-pins those corners at every voxel step of a one-voxel-wide
@@ -33,9 +46,24 @@ def extract_surface(
     """
     surf = surface_quads(grid, scalars=scalars, background_value=background_value)
     dx = np.min(grid.spacing)
+    if method == "fair":
+        from imagemesh.fairing import fair_surface_net
+
+        return fair_surface_net(
+            surf,
+            dx,
+            iterations=40 if iterations is None else iterations,
+            background_value=background_value,
+            degenerate=degenerate,
+            **fair_kwargs,
+        )
+    if method != "laplace":
+        raise ValueError(f"unknown method={method!r}")
+    if fair_kwargs:
+        raise TypeError(f"unexpected arguments for method='laplace': {sorted(fair_kwargs)}")
     surf = smooth_surface_net(
         surf,
-        iterations=iterations,
+        iterations=16 if iterations is None else iterations,
         distance=dx,
         scale=smoothing_scale,
         fix_bounds=True,
@@ -282,6 +310,29 @@ def transfer_labels(source_mesh, target_mesh, label_name="boundary_labels"):
     _, idx = tree.query(target_mesh.cell_centers().points, k=1)
     target_mesh[label_name] = source_mesh[label_name][idx]
     return target_mesh
+
+
+def foreign_points(surf, grid, scalars="data", label_name="boundary_labels", background_value=0):
+    """
+    Mask of the surface points that lie in a voxel of the label image grid
+    whose label is none of the labels of their faces: a cheap check that the
+    smoothing did not move a surface into a third region (e.g. one cell into
+    another). Points outside the image count as in the background.
+    """
+    P = np.asarray(surf.points)
+    dims = np.array(grid.dimensions) - 1
+    img = np.asarray(grid.cell_data[scalars]).reshape(tuple(dims), order="F")
+    ijk = np.floor((P - np.asarray(grid.origin)) / np.asarray(grid.spacing)).astype(np.int64)
+    inside = np.all((ijk >= 0) & (ijk < dims), axis=1)
+    lab = np.full(len(P), background_value, dtype=img.dtype)
+    i = ijk[inside]
+    lab[inside] = img[i[:, 0], i[:, 1], i[:, 2]]
+    F = surf.regular_faces
+    L = np.asarray(surf.cell_data[label_name])
+    ok = np.zeros(len(P), bool)
+    for k in range(F.shape[1]):
+        np.logical_or.at(ok, F[:, k], (lab[F[:, k]] == L[:, 0]) | (lab[F[:, k]] == L[:, 1]))
+    return ~ok
 
 
 def label_volumes(V, F, L):
