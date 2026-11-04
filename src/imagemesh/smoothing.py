@@ -173,24 +173,44 @@ def triangulate_quads(points, quads):
     by two surfaces is split the same way in both, independent of its vertex
     order and orientation.
     """
-    quads = np.asarray(quads)
-    p = np.asarray(points)
-    d02 = np.linalg.norm(p[quads[:, 0]] - p[quads[:, 2]], axis=1)
-    d13 = np.linalg.norm(p[quads[:, 1]] - p[quads[:, 3]], axis=1)
-    min02 = np.minimum(quads[:, 0], quads[:, 2])
-    min13 = np.minimum(quads[:, 1], quads[:, 3])
-    use13 = (d13 < d02) | ((d13 == d02) & (min13 < min02))
+    return _triangulate_quads(
+        np.ascontiguousarray(points, dtype=np.float64), np.ascontiguousarray(quads, dtype=np.int64)
+    )
 
-    def folds(q):
-        # normals of the triangles (0, 1, 2) and (0, 2, 3) point in opposite directions
-        n1 = np.cross(p[q[:, 1]] - p[q[:, 0]], p[q[:, 2]] - p[q[:, 0]])
-        n2 = np.cross(p[q[:, 2]] - p[q[:, 0]], p[q[:, 3]] - p[q[:, 0]])
-        return np.einsum("ij,ij->i", n1, n2) < 0
 
-    fold02, fold13 = folds(quads), folds(np.roll(quads, -1, axis=1))
-    use13 = np.where(fold02 != fold13, fold02, use13)
-    q = np.where(use13[:, None], np.roll(quads, -1, axis=1), quads)
-    return np.stack([q[:, [0, 1, 2]], q[:, [0, 2, 3]]], axis=1).reshape(-1, 3)
+@nb.njit(cache=True)
+def _folds(p, a, b, c, d):
+    """Whether the triangles (a, b, c) and (a, c, d) point in opposite directions."""
+    u0, u1, u2 = p[b, 0] - p[a, 0], p[b, 1] - p[a, 1], p[b, 2] - p[a, 2]
+    v0, v1, v2 = p[c, 0] - p[a, 0], p[c, 1] - p[a, 1], p[c, 2] - p[a, 2]
+    w0, w1, w2 = p[d, 0] - p[a, 0], p[d, 1] - p[a, 1], p[d, 2] - p[a, 2]
+    n0, n1, n2 = u1 * v2 - u2 * v1, u2 * v0 - u0 * v2, u0 * v1 - u1 * v0
+    m0, m1, m2 = v1 * w2 - v2 * w1, v2 * w0 - v0 * w2, v0 * w1 - v1 * w0
+    return n0 * m0 + n1 * m1 + n2 * m2 < 0
+
+
+@nb.njit(parallel=True, cache=True)
+def _triangulate_quads(p, quads):
+    m = len(quads)
+    tris = np.empty((2 * m, 3), np.int64)
+    for f in nb.prange(m):
+        q0, q1, q2, q3 = quads[f, 0], quads[f, 1], quads[f, 2], quads[f, 3]
+        d02 = np.sqrt(
+            (p[q0, 0] - p[q2, 0]) ** 2 + (p[q0, 1] - p[q2, 1]) ** 2 + (p[q0, 2] - p[q2, 2]) ** 2
+        )
+        d13 = np.sqrt(
+            (p[q1, 0] - p[q3, 0]) ** 2 + (p[q1, 1] - p[q3, 1]) ** 2 + (p[q1, 2] - p[q3, 2]) ** 2
+        )
+        use13 = d13 < d02 or (d13 == d02 and min(q1, q3) < min(q0, q2))
+        fold02 = _folds(p, q0, q1, q2, q3)
+        fold13 = _folds(p, q1, q2, q3, q0)
+        if fold02 != fold13:
+            use13 = fold02
+        if use13:
+            q0, q1, q2, q3 = q1, q2, q3, q0
+        tris[2 * f, 0], tris[2 * f, 1], tris[2 * f, 2] = q0, q1, q2
+        tris[2 * f + 1, 0], tris[2 * f + 1, 1], tris[2 * f + 1, 2] = q0, q2, q3
+    return tris
 
 
 def smooth_surface_net(

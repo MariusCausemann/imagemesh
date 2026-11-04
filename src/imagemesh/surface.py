@@ -35,8 +35,10 @@ def extract_surface(
     contour_labels (iterations defaults to 16); the displacement of each
     point is limited to smoothing_scale * dx.
     method="fair": volume-preserving fairing bounded by the voxel surface,
-    imagemesh.fairing.fair_surface_net (iterations defaults to 40); fair_kwargs
-    (alpha, dead_zone, max_distance, volume, ...) are passed on.
+    imagemesh.fairing.fair_surface_net, whose influence_radius (voxels; default
+    None: no limit, 100 steps) bounds how far a voxel affects the surface,
+    bitwise; iterations defaults to the number of steps it allows. fair_kwargs (influence_radius,
+    alpha, dead_zone, max_distance, volume, ...) are passed on.
 
     degenerate: build_stencils' treatment of quads whose opposite corners have
     nested junction stencils. None (VTK) keeps junction curves smoothed as
@@ -52,8 +54,8 @@ def extract_surface(
         return fair_surface_net(
             surf,
             dx,
-            iterations=40 if iterations is None else iterations,
-            background_value=background_value,
+            iterations=iterations,
+            bounds=grid.bounds,
             degenerate=degenerate,
             **fair_kwargs,
         )
