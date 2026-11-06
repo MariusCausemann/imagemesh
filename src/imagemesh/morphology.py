@@ -97,8 +97,25 @@ def smooth(img, iterations, radius, labels=None):
     return img
 
 
-def removeislands(img, minsize):
-    return cc3d.dust(img, threshold=minsize, connectivity=6)
+def removeislands(img, minsize, keep_boundary=False):
+    """
+    Remove the connected pieces (6-connected, per label) of fewer than minsize
+    voxels (cc3d.dust). keep_boundary: remove only pieces that lie fully
+    inside the image; pieces touching the image boundary are kept, since
+    their full size may lie outside (an image that is a window of a larger
+    one, e.g. a tile with a halo).
+    """
+    if not keep_boundary:
+        return cc3d.dust(img, threshold=minsize, connectivity=6)
+    cc, n = cc3d.connected_components(img, connectivity=6, return_N=True)
+    small = np.bincount(cc.ravel(), minlength=n + 1) < minsize
+    small[0] = False  # background
+    for a in range(img.ndim):
+        for end in (0, -1):
+            small[cc.take(end, axis=a)] = False
+    out = img.copy()
+    out[small[cc]] = 0
+    return out
 
 
 @njit(parallel=True, cache=True)
