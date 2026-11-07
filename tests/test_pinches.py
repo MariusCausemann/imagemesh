@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 import pyvista as pv
+from scipy import ndimage
 
 from imagemesh.pinches import count_pinches, remove_pinches
 
@@ -49,6 +50,11 @@ def touching_cells(img):
     return False
 
 
+def pieces(img, label):
+    """Number of face-connected pieces of label."""
+    return ndimage.label(img == label)[1]
+
+
 def edge_pinch(a=1, b=0):
     """Two boxes of label a touching along an edge (in z), b elsewhere."""
     img = np.full((8, 8, 6), b, np.int32)
@@ -66,15 +72,17 @@ def vertex_pinch(a=1, b=0):
 
 
 @pytest.mark.parametrize("make", [edge_pinch, vertex_pinch])
-def test_remove_pinches_thickens_cell(make):
+def test_remove_pinches_separates_cell(make):
     img = make()
     assert count_pinches(img) > 0
     out = remove_pinches(img)
     assert count_pinches(out) == 0
     assert non_manifold(out) == 0
-    # thickening: the cell only grows, and only by a few voxels
-    assert np.all(out[img == 1] == 1)
+    # a pinch is not a connection: the cell only loses a few voxels at the
+    # contact, and its face-connected pieces stay as they were
+    assert np.all(out[img == 0] == 0)
     assert 0 < np.sum(out != img) <= 4
+    assert pieces(out, 1) == pieces(img, 1)
 
 
 @pytest.mark.parametrize("make", [edge_pinch, vertex_pinch])
@@ -96,13 +104,18 @@ def test_remove_pinches_keeps_cells_separated():
 
 
 def test_remove_pinches_cells_in_contact():
-    # checkerboard of two cells (no background): both are pinched
+    # checkerboard of two cells (no background): both are pinched, and they are
+    # separated by background where that splits neither
     img = edge_pinch(a=1, b=2)
     out = remove_pinches(img)
     assert count_pinches(out) == 0
-    assert non_manifold(out) == 0
-    assert not np.any(out == 0)
-    assert np.sum(out != img) <= 4
+    # the cells are separated by background voxels: three labels meet along
+    # junction lines, so the surface of every label is tested on its own
+    for label in (0, 1, 2):
+        assert non_manifold(np.pad((out == label).astype(np.int32), 1)) == 0
+    assert np.sum(out != img) <= 8  # at most 2 per layer of the 4-voxel contact
+    for label in (1, 2):
+        assert pieces(out, label) <= pieces(img, label)
 
 
 def test_pinch_free_image_unchanged():
