@@ -2,6 +2,7 @@
 
 from unittest.mock import patch
 
+import cc3d
 import numpy as np
 import pytest
 import scipy.ndimage as ndi
@@ -82,6 +83,26 @@ class TestImageOperations:
         # Small island should be removed, large one should remain
         assert 1 not in np.unique(result)
         assert 2 in np.unique(result)
+
+    def test_removeislands_keep_boundary(self):
+        """keep_boundary keeps small pieces that touch the image boundary;
+        pieces fully inside are dusted as without it."""
+        rng = np.random.default_rng(0)
+        img = rng.integers(0, 4, (12, 11, 10)).astype(np.uint64) * (10**9 + 7)
+        img[3:6, 3:6, 3:6] = 5  # 27 voxels inside
+        img[0:2, 4:6, 4:6] = 6  # 8 voxels on the boundary
+        ref = removeislands(img, minsize=10)
+        got = removeislands(img, minsize=10, keep_boundary=True)
+        assert got.dtype == img.dtype
+        assert (got[img == 6] == 6).all()  # kept, touches x = 0
+        assert (got[img == 5] == 5).all()
+        cc = cc3d.connected_components(img, connectivity=6)
+        inner = np.ones(img.shape, bool)
+        inner[1:-1, 1:-1, 1:-1] = False
+        border = np.isin(cc, np.unique(cc[inner]))
+        np.testing.assert_array_equal(got[~border], ref[~border])
+        np.testing.assert_array_equal(got[border], img[border])
+        np.testing.assert_array_equal(removeislands(img, 10, keep_boundary=False), ref)
 
 
 class TestImageProcessingIntegration:
