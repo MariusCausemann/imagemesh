@@ -17,6 +17,8 @@ vtkConstrainedSmoothingFilter:
   sphere of radius `distance`.
 """
 
+from typing import NamedTuple
+
 import numba as nb
 import numpy as np
 import pyvista as pv
@@ -134,13 +136,15 @@ def _smooth_step(indptr, indices, data, x0, x, xn, relaxation, d2, fixed):
 
 
 def constrained_smooth(
-    points, A, iterations=16, relaxation=0.5, distance=1.0, convergence=0.0, fixed=None
-):
+    points, A, iterations=16, relaxation=0.5, distance=1.0, convergence=0.0, fixed=None,
+    guard=None,
+):  # fmt: skip
     """
     vtkConstrainedSmoothingFilter with a sphere constraint.
 
     fixed: optional (n_points, 3) bool mask of coordinates that must not move,
-    e.g. fixed[k, 2] = True keeps point k in its z-plane.
+    e.g. fixed[k, 2] = True keeps point k in its z-plane. guard: optional
+    PlanarGuard (planar_guard) of quads that every step keeps valid.
     """
     x0 = np.ascontiguousarray(points, dtype=np.float64)
     x = x0.copy()
@@ -151,6 +155,7 @@ def constrained_smooth(
     xn = np.empty_like(x)
     for _ in range(iterations):
         moved = _smooth_step(A.indptr, A.indices, A.data, x0, x, xn, relaxation, distance**2, fixed)
+        apply_guard(x, xn, guard)
         x, xn = xn, x
         if moved <= convergence:
             break
@@ -254,3 +259,159 @@ def smooth_surface_net(
     for name, arr in surf.cell_data.items():
         out.cell_data[name] = np.repeat(arr, 2, axis=0)
     return out
+
+
+# ---------------------------------------------------------------- planar guard
+#
+# Quads lying in an axis plane (e.g. the caps on the cut planes of a block
+# surface) that must stay valid while their points move: the diagonal
+# triangulate_quads picks has two triangles of the original orientation with
+# at least the minimum area. A smoothing or fairing step that would break a
+# guarded quad keeps the moving corners of that quad where they were before
+# the step (repeated until every guarded quad is valid: the previous state
+# was valid, so this ends). Valid at the start, valid after every step.
+
+
+class PlanarGuard(NamedTuple):
+    """Guarded planar quads, see planar_guard."""
+
+    quads: np.ndarray  # (m, 4) int64, indices into the points then extra
+    axis: np.ndarray  # (m,) normal axis of each quad's plane
+    sign: np.ndarray  # (m,) orientation (+-1) of each quad in its plane
+    min_area2: np.ndarray  # (m,) smallest twice-area of a triangle
+    extra: np.ndarray  # (k, 3) fixed points the quads may use (index n + j)
+
+
+def planar_guard(points, quads, axis, min_area, extra=None):
+    """
+    The guard of the planar quads (indices into points, then into extra:
+    fixed points that never move) with plane normal axis per quad, valid at
+    points: each keeps its orientation there and the two triangles of the
+    diagonal triangulate_quads picks keep at least min_area (per quad or
+    scalar) each. Raises if a quad is not valid at points.
+    """
+    P = np.asarray(points, np.float64)
+    E = np.zeros((0, 3)) if extra is None else np.asarray(extra, np.float64)
+    q = np.ascontiguousarray(quads, np.int64).reshape(-1, 4)
+    ax = np.ascontiguousarray(np.broadcast_to(np.asarray(axis, np.int64), (len(q),)))
+    X = np.vstack([P, E])
+    b, c = (ax + 1) % 3, (ax + 2) % 3
+    x, y = X[q, b[:, None]], X[q, c[:, None]]
+    a2 = np.sum(x * np.roll(y, -1, axis=1) - np.roll(x, -1, axis=1) * y, axis=1)
+    sign = np.sign(a2).astype(np.int64)
+    if (sign == 0).any():
+        raise ValueError(f"planar_guard: {(sign == 0).sum()} quads of zero area")
+    m2 = np.ascontiguousarray(np.broadcast_to(2.0 * np.asarray(min_area, np.float64), (len(q),)))
+    g = PlanarGuard(q, ax, sign, m2, np.ascontiguousarray(E))
+    bad = guard_violations(P, g)
+    if len(bad):
+        raise ValueError(f"planar_guard: {len(bad)} quads not valid at the given points")
+    return g
+
+
+def empty_guard():
+    return PlanarGuard(
+        np.zeros((0, 4), np.int64), np.zeros(0, np.int64), np.zeros(0, np.int64),
+        np.zeros(0), np.zeros((0, 3)),
+    )  # fmt: skip
+
+
+def guard_violations(points, guard):
+    """Indices of the guarded quads not valid at points."""
+    X = np.ascontiguousarray(points, np.float64)
+    g = guard
+    ok = _guard_ok_all(X, g.extra, g.quads, g.axis, g.sign, g.min_area2)
+    return np.flatnonzero(~ok)
+
+
+@nb.njit(cache=True)
+def _gp(X, E, i, a):
+    n = len(X)
+    return X[i, a] if i < n else E[i - n, a]
+
+
+@nb.njit(cache=True)
+def _ga2(X, E, i, j, k, b, c):
+    """Twice the signed area of triangle (i, j, k) in the plane of axes (b, c)."""
+    xi, yi = _gp(X, E, i, b), _gp(X, E, i, c)
+    xj, yj = _gp(X, E, j, b), _gp(X, E, j, c)
+    xk, yk = _gp(X, E, k, b), _gp(X, E, k, c)
+    return (xj - xi) * (yk - yi) - (yj - yi) * (xk - xi)
+
+
+@nb.njit(cache=True)
+def _quad_ok(X, E, q0, q1, q2, q3, ax, sg, amin2):
+    """Whether the diagonal triangulate_quads picks gives two triangles of
+    orientation sg with twice-area >= amin2 (on a tie of the diagonals'
+    lengths: both, as the tie break depends on the global point ids)."""
+    b, c = (ax + 1) % 3, (ax + 2) % 3
+    a012 = sg * _ga2(X, E, q0, q1, q2, b, c)
+    a023 = sg * _ga2(X, E, q0, q2, q3, b, c)
+    a123 = sg * _ga2(X, E, q1, q2, q3, b, c)
+    a130 = sg * _ga2(X, E, q1, q3, q0, b, c)
+    ok02 = min(a012, a023) >= amin2
+    ok13 = min(a123, a130) >= amin2
+    fold02 = a012 * a023 < 0
+    fold13 = a123 * a130 < 0
+    if fold02 != fold13:
+        return ok13 if fold02 else ok02
+    d02 = np.sqrt(
+        (_gp(X, E, q0, b) - _gp(X, E, q2, b)) ** 2 + (_gp(X, E, q0, c) - _gp(X, E, q2, c)) ** 2
+    )
+    d13 = np.sqrt(
+        (_gp(X, E, q1, b) - _gp(X, E, q3, b)) ** 2 + (_gp(X, E, q1, c) - _gp(X, E, q3, c)) ** 2
+    )
+    if d13 < d02:
+        return ok13
+    if d02 < d13:
+        return ok02
+    return ok02 and ok13
+
+
+@nb.njit(parallel=True, cache=True)
+def _guard_ok_all(X, E, gq, gax, gsg, gmin):
+    ok = np.empty(len(gq), np.bool_)
+    for f in nb.prange(len(gq)):
+        ok[f] = _quad_ok(X, E, gq[f, 0], gq[f, 1], gq[f, 2], gq[f, 3], gax[f], gsg[f], gmin[f])
+    return ok
+
+
+@nb.njit(cache=True)
+def _guard(Xold, Xnew, E, gq, gax, gsg, gmin, held):
+    """
+    Keep the moving corners of every guarded quad that Xnew breaks at Xold,
+    until all are valid (Xold valid: ends). held[i] is set for the points
+    kept. Returns the number of quads still invalid (0 if Xold was valid).
+    """
+    n = len(Xnew)
+    changed = True
+    while changed:
+        changed = False
+        for f in range(len(gq)):
+            q0, q1, q2, q3 = gq[f, 0], gq[f, 1], gq[f, 2], gq[f, 3]
+            if _quad_ok(Xnew, E, q0, q1, q2, q3, gax[f], gsg[f], gmin[f]):
+                continue
+            for k in range(4):
+                i = gq[f, k]
+                if i < n and not held[i]:
+                    held[i] = True
+                    Xnew[i, 0], Xnew[i, 1], Xnew[i, 2] = Xold[i, 0], Xold[i, 1], Xold[i, 2]
+                    changed = True
+    bad = 0
+    for f in range(len(gq)):
+        if not _quad_ok(Xnew, E, gq[f, 0], gq[f, 1], gq[f, 2], gq[f, 3], gax[f], gsg[f], gmin[f]):
+            bad += 1
+    return bad
+
+
+def apply_guard(Xold, Xnew, guard):
+    """Xnew (in place) with the guarded quads valid (see _guard); returns the
+    mask of the points kept at Xold."""
+    held = np.zeros(len(Xnew), np.bool_)
+    if guard is None or not len(guard.quads):
+        return held
+    g = guard
+    bad = _guard(Xold, Xnew, g.extra, g.quads, g.axis, g.sign, g.min_area2, held)
+    if bad:
+        raise RuntimeError(f"planar guard: {bad} quads invalid before the step")
+    return held

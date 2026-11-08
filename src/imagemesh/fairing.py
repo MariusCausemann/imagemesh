@@ -80,7 +80,7 @@ import numpy as np
 import pyvista as pv
 import scipy.sparse as sp
 
-from imagemesh.smoothing import build_stencils, triangulate_quads
+from imagemesh.smoothing import _guard, apply_guard, build_stencils, empty_guard, triangulate_quads
 
 
 @nb.njit(cache=True)
@@ -226,6 +226,7 @@ def _edge_neighbours(quads, labels, p_ptr, p_idx):
 @nb.njit(parallel=True, cache=True)
 def _fair(
     X0, quads, fixed, junction,
+    gE, gq, gax, gsg, gmin,  # planar guard (smoothing.planar_guard)
     a_ptr, a_idx, a_val,  # stencils A (L = I - A)
     lt_ptr, lt_idx, lt_val,  # L^T
     bound,  # Gershgorin bound of the row sums of |L^T L|
@@ -244,6 +245,7 @@ def _fair(
     w = np.ones(n)
     an = np.empty((m, 3))
     r98 = 0.98 * r
+    held = np.zeros(n, np.bool_)
     for _ in range(iterations):
         for q in nb.prange(m):
             _area_vector(X, quads, q, an[q])
@@ -301,6 +303,13 @@ def _fair(
                     g = w[i] * (X[i, a] - T[i, a]) + alpha * z
                     vel[i, a] = momentum * vel[i, a] - step * g / d
                     Xn[i, a] = X[i, a] + vel[i, a]
+        if len(gq):
+            held[:] = False
+            if _guard(X, Xn, gE, gq, gax, gsg, gmin, held):
+                raise RuntimeError("planar guard: invalid quads before a fairing step")
+            for i in range(n):
+                if held[i]:
+                    vel[i, 0] = vel[i, 1] = vel[i, 2] = 0.0
         X, Xn = Xn, X
     return X
 
@@ -461,6 +470,7 @@ def fair_surface_net(
     fix_bounds=True,
     bounds=None,
     fixed=None,
+    guard=None,
     stiffness=100.0,
     degenerate=None,
     step=1.0,
@@ -489,7 +499,11 @@ def fair_surface_net(
     fix_bounds keeps points on the faces of the box bounds (default: the
     bounding box of surf; pass the image bounds for the range guarantee) on
     their box face; fixed: optional (n_points, 3) mask of coordinates that
-    must not move. step, momentum: of the heavy-ball Jacobi steps.
+    must not move. guard: optional smoothing.PlanarGuard (planar_guard, valid
+    at the points of surf) of planar quads that every step keeps valid: a
+    point whose move would break one keeps its position in that step (in the
+    fairing steps, the volume restoration and the final projection; such a
+    point may stay outside the distance limit). step, momentum: of the heavy-ball Jacobi steps.
     Returns the triangulated surface with the cell data repeated per triangle
     and the field data 'dx', 'influence_radius' (the range of influence of
     this run in voxels, 2 iterations + 1 + volume_repeats (1 + volume_rings)
@@ -548,8 +562,10 @@ def fair_surface_net(
     fmin = np.ascontiguousarray(X0[quads].min(axis=1))
     fmax = np.ascontiguousarray(X0[quads].max(axis=1))
     r = np.inf if max_distance is None else max_distance * dx
+    g = empty_guard() if guard is None else guard
     X = _fair(
-        X0, quads, fixed, junction, a_ptr, a_idx, a_val, lt_ptr, lt_idx, lt_val, bound,
+        X0, quads, fixed, junction, g.extra, g.quads, g.axis, g.sign, g.min_area2,
+        a_ptr, a_idx, a_val, lt_ptr, lt_idx, lt_val, bound,
         p_ptr, p_idx, fmin, fmax,
         float(alpha), 0.0 if dead_zone is None else dead_zone * dx, r, float(stiffness),
         float(step), float(momentum), dead_zone is not None, max_distance is not None,
@@ -558,9 +574,14 @@ def fair_surface_net(
     if volume:
         e_ptr, e_idx = _edge_neighbours(quads, labels, p_ptr, p_idx)
         for _ in range(int(volume_repeats)):
-            X = _restore_volume(X, X0, quads, fixed, p_ptr, p_idx, e_ptr, e_idx, int(volume_rings))
+            Xv = _restore_volume(X, X0, quads, fixed, p_ptr, p_idx, e_ptr, e_idx, int(volume_rings))
+            apply_guard(X, Xv, guard)
+            X = Xv
     if max_distance is not None:
-        _project(X, X0, fixed, quads, p_ptr, p_idx, fmin, fmax, r)
+        Xp = X.copy()
+        _project(Xp, X0, fixed, quads, p_ptr, p_idx, fmin, fmax, r)
+        apply_guard(X, Xp, guard)
+        X = Xp
 
     if max_distance is not None:
         dmax = float(_max_distance(X, X0, quads, p_ptr, p_idx, fmin, fmax))
