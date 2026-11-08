@@ -55,9 +55,12 @@ a parallel numba kernel on plain face arrays:
 
 import time
 
+import fastremap
 import numba as nb
 import numpy as np
 import pyvista as pv
+
+from imagemesh.smoothing import edge_table
 
 INTERIOR, CURVE, CORNER = 0, 1, 2
 
@@ -298,16 +301,9 @@ def _classify(F, vf_ptr, vf_idx, feature_degree):
 
 def _feature_edges(F, patch, nv):
     """Feature edges (valence != 2 or different label pairs), (n, 2) sorted."""
-    e = np.sort(np.stack([F, np.roll(F, -1, axis=1)], axis=-1).reshape(-1, 2), axis=1)
-    key = e[:, 0] * nv + e[:, 1]
-    ukey, inv, valence = np.unique(key, return_inverse=True, return_counts=True)
-    fpatch = np.repeat(patch, 3)
-    pmin = np.full(len(ukey), np.iinfo(np.int64).max)
-    pmax = np.full(len(ukey), -1)
-    np.minimum.at(pmin, inv, fpatch)
-    np.maximum.at(pmax, inv, fpatch)
-    feat = ukey[(valence != 2) | (pmin != pmax)]
-    return np.stack([feat // nv, feat % nv], axis=1)
+    eu, ev, valence, pmin, pmax = edge_table(F, nv, patch)
+    feat = (valence != 2) | (pmin != pmax)
+    return np.column_stack([eu[feat], ev[feat]])
 
 
 def _feature_degree(F, patch, nv):
@@ -332,11 +328,14 @@ def _feature_neighbours(E, nv):
 
 
 def _patches(labels):
-    """Label pair of each face, independent of the orientation."""
-    s = np.sort(labels, axis=1).astype(np.int64)
-    # a 1d key of the pair is much faster to unique than the rows
-    _, patch = np.unique(s[:, 0] * (s[:, 1].max() + 1) + s[:, 1], return_inverse=True)
-    return patch.ravel().astype(np.int64)
+    """Label pair of each face, independent of the orientation (ids only
+    compared for equality)."""
+    s = np.sort(labels, axis=1)
+    # labels renumbered to 0..k-1 first, so the 1d key of the pair cannot
+    # overflow (labels may be large, e.g. shifted by a block offset)
+    r = fastremap.renumber(s, start=0, preserve_zero=False)[0].astype(np.int64)
+    key = r[:, 0] * (int(r.max()) + 1) + r[:, 1]
+    return fastremap.renumber(key, start=0, preserve_zero=False)[0].astype(np.int64).ravel()
 
 
 def _plane_masks(V, tol):
@@ -1141,27 +1140,90 @@ def _propose(
     return target, cost
 
 
+@nb.njit(cache=True, inline="always")
+def _before(cost, a, b):
+    """Proposal a comes before b: smaller cost, ties to the smaller vertex."""
+    return cost[a] < cost[b] or (cost[a] == cost[b] and a < b)
+
+
 @nb.njit(cache=True)
+def _first_at(x, target, cost, active, vf_ptr, vf_idx, F):
+    """The first active proposal with an end at x (its vertex u), or -1: u = x,
+    or a neighbour u of x with target x."""
+    best = x if active[x] else -1
+    for jj in range(vf_ptr[x], vf_ptr[x + 1]):
+        g = vf_idx[jj]
+        for k in range(3):
+            y = F[g, k]
+            if y != x and active[y] and target[y] == x:
+                if best < 0 or _before(cost, y, best):
+                    best = y
+    return best
+
+
+@nb.njit(cache=True)
+def _taken(u, target, cost, first, vf_ptr, vf_idx, F):
+    """No proposal in conflict with u -> target[u] comes before it."""
+    for e in range(2):
+        x = u if e == 0 else target[u]
+        for jj in range(vf_ptr[x], vf_ptr[x + 1]):
+            g = vf_idx[jj]
+            for k in range(3):
+                b = first[F[g, k]]
+                if b >= 0 and b != u and _before(cost, b, u):
+                    return False
+    return True
+
+
+@nb.njit(parallel=True, cache=True)
+def _select_round(cand, target, cost, active, first, covered, win, F, vf_ptr, vf_idx):
+    """One round of _select over the active proposals cand (vertices u)."""
+    for t in nb.prange(len(cand)):
+        u = cand[t]
+        v = target[u]
+        first[u] = _first_at(u, target, cost, active, vf_ptr, vf_idx, F)
+        first[v] = _first_at(v, target, cost, active, vf_ptr, vf_idx, F)
+    for t in nb.prange(len(cand)):
+        u = cand[t]
+        win[u] = _taken(u, target, cost, first, vf_ptr, vf_idx, F)
+    for t in nb.prange(len(cand)):
+        u = cand[t]
+        if win[u]:
+            for e in range(2):
+                x = u if e == 0 else target[u]
+                for jj in range(vf_ptr[x], vf_ptr[x + 1]):
+                    g = vf_idx[jj]
+                    for k in range(3):
+                        covered[F[g, k]] = True
+    for t in nb.prange(len(cand)):
+        u = cand[t]
+        v = target[u]
+        first[u] = -1
+        first[v] = -1
+        if win[u] or covered[u] or covered[v]:
+            active[u] = False
+
+
 def _select(target, cost, F, vf_ptr, vf_idx):
     """
     Greedy maximal set of proposals u -> target[u] with disjoint face stars
-    (faces around u and v), in order of increasing cost.
+    (faces around u and v), in order of increasing (cost, u). Two proposals
+    conflict iff an end of one is a vertex of a face around an end of the
+    other. Computed in parallel rounds: a proposal is taken when it comes
+    before every active proposal it conflicts with, and the proposals in
+    conflict with a taken one drop out. This is the set of the sequential
+    greedy pass, independent of the number of threads.
     """
-    cu = np.flatnonzero(target >= 0)
-    # the stars of u' -> v' and of an accepted u -> v share a face iff u' or
-    # v' is a vertex of a face around u or v, so only these are marked
-    covered = np.zeros(len(vf_ptr) - 1, np.bool_)
-    win = np.zeros(len(cu), np.bool_)
-    for i in np.argsort(cost[cu]):
-        u, v = cu[i], target[cu[i]]
-        if covered[u] or covered[v]:
-            continue
-        win[i] = True
-        for x in (u, v):
-            for jj in range(vf_ptr[x], vf_ptr[x + 1]):
-                g = vf_idx[jj]
-                covered[F[g, 0]] = covered[F[g, 1]] = covered[F[g, 2]] = True
-    return cu[win]
+    nv = len(target)
+    active = target >= 0
+    cand = np.flatnonzero(active)
+    first = np.full(nv, -1, np.int64)  # _first_at of the ends of the candidates
+    covered = np.zeros(nv, np.bool_)
+    win = np.zeros(nv, np.bool_)
+    while len(cand):
+        _select_round(cand, target, cost, active, first, covered, win, F, vf_ptr, vf_idx)
+        cand = cand[active[cand]]
+    return np.flatnonzero(win)
 
 
 @nb.njit(parallel=True, cache=True)
@@ -1416,6 +1478,7 @@ def simplify_surface(
     label_name="boundary_labels",
     placement="endpoint",
     max_rounds=1000,
+    min_collapse_fraction=1e-4,
     verbose=False,
 ):
     """
@@ -1444,6 +1507,9 @@ def simplify_surface(
         points), "qem" additionally moves the kept vertex to the position
         minimizing the quadric error (restricted to feature curves and
         bounding box planes), for a closer fit at the same number of faces.
+    min_collapse_fraction: stop after a round with fewer collapses than this
+        fraction of the faces (the last rounds collapse few edges but cost a
+        pass over all faces each); 0 runs until no collapse is left.
 
     Returns the simplified pv.PolyData with the labels as cell data.
     """
@@ -1533,6 +1599,7 @@ def simplify_surface(
         tr = _lap(timing, "select", tr)
         if len(wu) == 0:
             break
+        n_faces = len(F)
         wv = target[wu]
         wp = tpos[wu]
         with nb.parallel_chunksize(16):
@@ -1553,6 +1620,8 @@ def simplify_surface(
                 f"round {it}: {len(wu)} collapses, {len(F)} faces, "
                 f"{dirty.sum()} dirty, {time.perf_counter() - t0:.2f}s"
             )
+        if len(wu) < min_collapse_fraction * n_faces:
+            break
 
     used = np.unique(F)
     vmap = np.full(nv, -1)
