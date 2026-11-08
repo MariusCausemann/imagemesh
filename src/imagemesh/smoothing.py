@@ -25,13 +25,130 @@ import pyvista as pv
 import scipy.sparse as sp
 
 
+@nb.njit(cache=True)
+def incident_faces(faces, n):
+    """CSR (indptr, indices): per point the faces it is a corner of, in
+    increasing order."""
+    k = faces.shape[1]
+    ptr = np.zeros(n + 1, np.int64)
+    for f in range(len(faces)):
+        for c in range(k):
+            ptr[faces[f, c] + 1] += 1
+    for i in range(n):
+        ptr[i + 1] += ptr[i]
+    idx = np.empty(ptr[n], np.int64)
+    fill = ptr[:-1].copy()
+    for f in range(len(faces)):
+        for c in range(k):
+            i = faces[f, c]
+            idx[fill[i]] = f
+            fill[i] += 1
+    return ptr, idx
+
+
+@nb.njit(parallel=True, cache=True)
+def _duplicate_faces(faces, ptr, idx):
+    """Mask of the faces with the same vertex set as an earlier face."""
+    m, k = faces.shape
+    dup = np.zeros(m, np.bool_)
+    for f in nb.prange(m):
+        u = faces[f, 0]
+        for c in range(1, k):
+            u = min(u, faces[f, c])
+        for jj in range(ptr[u], ptr[u + 1]):
+            g = idx[jj]
+            if g >= f:
+                break
+            same = True
+            for c in range(k):
+                x, y = faces[f, c], faces[g, c]
+                inf = ing = False
+                for c2 in range(k):
+                    ing |= faces[g, c2] == x
+                    inf |= faces[f, c2] == y
+                if not (ing and inf):
+                    same = False
+                    break
+            if same:
+                dup[f] = True
+                break
+    return dup
+
+
 def unique_faces(faces):
-    """Faces with duplicates (same vertex set, any order) removed."""
-    s = np.ascontiguousarray(np.sort(faces, axis=1))
-    # one void scalar per row: 1d np.unique is much faster than axis=0
-    key = s.view(np.dtype((np.void, s.dtype.itemsize * s.shape[1]))).ravel()
-    _, idx = np.unique(key, return_index=True)
-    return faces[np.sort(idx)]
+    """Faces with duplicates (same vertex set, any order) removed, the first
+    of each kept, in order."""
+    faces = np.ascontiguousarray(faces, np.int64)
+    if not len(faces):
+        return faces
+    ptr, idx = incident_faces(faces, int(faces.max()) + 1)
+    return faces[~_duplicate_faces(faces, ptr, idx)]
+
+
+@nb.njit(parallel=True, cache=True)
+def _edge_pass(faces, ptr, idx, fval, fill, nchunk, cnt, off, eu, ev, valence, vmin, vmax):
+    """Per point u, the edges (u, x), x > u, of the faces around it, in
+    increasing x: counted (fill=False) or written from off[u]."""
+    n, k = len(ptr) - 1, faces.shape[1]
+    maxdeg = 0
+    for i in range(n):
+        maxdeg = max(maxdeg, ptr[i + 1] - ptr[i])
+    nchunk = max(1, min(n, nchunk))
+    B = (n + nchunk - 1) // nchunk
+    for ch in nb.prange(nchunk):
+        xs = np.empty(2 * maxdeg, np.int64)
+        vs = np.empty(2 * maxdeg, np.int64)
+        for u in range(ch * B, min(n, (ch + 1) * B)):
+            m = 0
+            for jj in range(ptr[u], ptr[u + 1]):
+                f = idx[jj]
+                for c in range(k):
+                    if faces[f, c] != u:
+                        continue
+                    for x in (faces[f, (c + k - 1) % k], faces[f, (c + 1) % k]):
+                        if x <= u:
+                            continue
+                        j = m  # insertion sort by x
+                        while j > 0 and xs[j - 1] > x:
+                            xs[j], vs[j] = xs[j - 1], vs[j - 1]
+                            j -= 1
+                        xs[j], vs[j] = x, fval[f]
+                        m += 1
+            e = off[u] if fill else 0
+            i = 0
+            while i < m:
+                j = i
+                lo = hi = vs[i]
+                while j + 1 < m and xs[j + 1] == xs[i]:
+                    j += 1
+                    lo, hi = min(lo, vs[j]), max(hi, vs[j])
+                if fill:
+                    eu[e], ev[e], valence[e], vmin[e], vmax[e] = u, xs[i], j - i + 1, lo, hi
+                e += 1
+                i = j + 1
+            if not fill:
+                cnt[u] = e
+
+
+def edge_table(faces, n, fval=None):
+    """
+    The edges of the polygons faces (corners in cyclic order) on n points,
+    each once, sorted by (u, v) with u < v: (u, v, valence (the number of
+    faces on the edge), and the smallest and largest per-face value fval on
+    it).
+    """
+    faces = np.ascontiguousarray(faces, np.int64)
+    fval = np.zeros(len(faces), np.int64) if fval is None else np.asarray(fval, np.int64)
+    ptr, idx = incident_faces(faces, n)
+    cnt = np.zeros(n, np.int64)
+    e0 = np.empty(0, np.int64)
+    nchunk = 64 * nb.get_num_threads()
+    _edge_pass(faces, ptr, idx, fval, False, nchunk, cnt, cnt, e0, e0, e0, e0, e0)
+    off = np.zeros(n + 1, np.int64)
+    np.cumsum(cnt, out=off[1:])
+    out = [np.empty(off[n], np.int64) for _ in range(5)]
+    _edge_pass(faces, ptr, idx, fval, True, nchunk, cnt, off, *out)
+    return tuple(out)
 
 
 def build_stencils(faces, n_points, optimized=True, degenerate="full"):
@@ -48,10 +165,8 @@ def build_stencils(faces, n_points, optimized=True, degenerate="full"):
     neighbourhood, "lock" keeps them in place, None keeps the VTK behaviour.
     """
     faces = unique_faces(np.asarray(faces))
-    edges = np.stack([faces, np.roll(faces, -1, axis=1)], axis=-1).reshape(-1, 2)
-    edges = np.sort(edges, axis=1).astype(np.int64)
-    key, valence = np.unique(edges[:, 0] * n_points + edges[:, 1], return_counts=True)
-    edges = np.column_stack([key // n_points, key % n_points])
+    eu, ev, valence, _, _ = edge_table(faces, n_points)
+    edges = np.column_stack([eu, ev])
 
     i = np.concatenate([edges[:, 0], edges[:, 1]])
     j = np.concatenate([edges[:, 1], edges[:, 0]])
@@ -383,6 +498,8 @@ def _guard(Xold, Xnew, E, gq, gax, gsg, gmin, held):
     until all are valid (Xold valid: ends). held[i] is set for the points
     kept. Returns the number of quads still invalid (0 if Xold was valid).
     """
+    if _guard_ok_all(Xnew, E, gq, gax, gsg, gmin).all():
+        return 0  # the common case, checked in parallel
     n = len(Xnew)
     changed = True
     while changed:

@@ -450,6 +450,22 @@ def _project(X, X0, fixed, quads, p_ptr, p_idx, fmin, fmax, r):
         X[i, 2] = X0[i, 2] if fixed[i, 2] else t2
 
 
+@nb.njit(parallel=True, cache=True)
+def _quad_boxes(X0, quads):
+    """Per quad the coordinate-wise min and max of its corners."""
+    m = len(quads)
+    fmin = np.empty((m, 3))
+    fmax = np.empty((m, 3))
+    for q in nb.prange(m):
+        for a in range(3):
+            lo = hi = X0[quads[q, 0], a]
+            for c in range(1, 4):
+                x = X0[quads[q, c], a]
+                lo, hi = min(lo, x), max(hi, x)
+            fmin[q, a], fmax[q, a] = lo, hi
+    return fmin, fmax
+
+
 def _bounds_mask(X, bounds, tol=1e-6):
     """(n, 3) mask of the coordinates on the faces of the box bounds."""
     lo, hi = np.asarray(bounds, float).reshape(3, 2).T
@@ -559,8 +575,7 @@ def fair_surface_net(
         np.maximum.at(hi, quads.ravel(), lab)
         junction |= lo != hi
 
-    fmin = np.ascontiguousarray(X0[quads].min(axis=1))
-    fmax = np.ascontiguousarray(X0[quads].max(axis=1))
+    fmin, fmax = _quad_boxes(X0, quads)
     r = np.inf if max_distance is None else max_distance * dx
     g = empty_guard() if guard is None else guard
     X = _fair(
