@@ -28,7 +28,8 @@ def extract_surface(
     Smoothed, triangulated multi-label surface of the label image grid
     (pv.ImageData with the labels as cell data `scalars`), with cell data
     'boundary_labels' (n_faces, 2): surface nets (surface_quads) followed by a
-    smoothing that keeps the points on the bounding box on their box face.
+    smoothing that keeps the points on the bounding box on their box face
+    and every point inside it.
     dx is stored in the field data.
 
     method="laplace": constrained Laplacian smoothing as in VTK's
@@ -69,6 +70,7 @@ def extract_surface(
         distance=dx,
         scale=smoothing_scale,
         fix_bounds=True,
+        bounds=grid.bounds,
         degenerate=degenerate,
     )
     surf.field_data["dx"] = [dx]

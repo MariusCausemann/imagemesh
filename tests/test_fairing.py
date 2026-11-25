@@ -95,3 +95,33 @@ def test_fair_stays_in_box(dent, kwargs):
     assert np.allclose(surf.bounds, grid.bounds)
     md = kwargs.get("max_distance", 1.0)
     assert surf.field_data["max_surface_distance"][0] <= md * DX * (1 + 1e-9)
+
+
+@pytest.mark.parametrize(
+    "dent", [[(7, 7), (9, 7), (9, 8), (9, 10), (10, 7), (10, 8)], [(5, 5), (5, 6)], [(5, 5)]]
+)
+def test_laplace_stays_in_box(dent):
+    """The Laplacian smoothing (method="laplace") keeps the dent floors in the box too."""
+    grid = dented_face(dent)
+    surf = extract_surface(grid)
+    P = np.asarray(surf.points)
+    lo, hi = np.asarray(grid.bounds).reshape(3, 2).T
+    assert (P >= lo).all() and (P <= hi).all()
+    assert np.allclose(surf.bounds, grid.bounds)
+
+
+def test_constrained_smooth_clamps_to_bounds():
+    """Weights that extrapolate push points out of the box; bounds clamp them."""
+    import scipy.sparse as sp
+
+    from imagemesh.smoothing import constrained_smooth
+
+    x = np.array([[0.0, 0.5, 0.5], [0.2, 0.5, 0.5], [1.0, 0.5, 0.5]])
+    # point 0 is pushed away from point 1: 2 x0 - x1
+    A = sp.csr_matrix(np.array([[2.0, -1.0, 0.0], [0.5, 0.0, 0.5], [0.0, 0.0, 1.0]]))
+    box = (0.0, 1.0, 0.0, 1.0, 0.0, 1.0)
+    free = constrained_smooth(x, A, iterations=4, relaxation=1.0, distance=np.inf)
+    assert free[0, 0] < 0.0
+    P = constrained_smooth(x, A, iterations=4, relaxation=1.0, distance=np.inf, bounds=box)
+    assert (P >= 0.0).all() and (P <= 1.0).all()
+    assert P[0, 0] == 0.0
