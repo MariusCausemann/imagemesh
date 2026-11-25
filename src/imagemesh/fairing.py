@@ -39,6 +39,15 @@ narrow measurements (see the range below) and leave dimples.
 
 A final projection guarantees dist(x_i, S0) <= max_distance for every point.
 
+Box. Every point stays inside the box `bounds` (the image bounds): the
+fairing steps, the volume restoration and the final projection clamp each
+coordinate to it. The distance limit alone does not keep a point inside: S0
+includes the voxel faces on the box, and a point may slide along S0 out of
+it (e.g. the floor of a one-voxel dent in the box face, which the fairing
+shrinks). Clamping is the projection onto the box, which contains S0, so it
+never increases the distance to S0, and it reads the point only (the range
+below is unchanged).
+
 Range of influence. Measure the distance between a surface point and a
 voxel in voxels, as the L-infinity distance from the point's voxel corner to
 the voxel (the cube [i, i+1] x [j, j+1] x [k, k+1]). The static data of a
@@ -232,6 +241,7 @@ def _fair(
     bound,  # Gershgorin bound of the row sums of |L^T L|
     p_ptr, p_idx,  # incident quads
     fmin, fmax,  # bounding boxes of the quads (distance limit)
+    lo, hi,  # the box: every coordinate is clamped to [lo, hi]
     alpha, h, r, stiffness, step, momentum,
     use_dead_zone, use_tube, iterations,
 ):  # fmt: skip
@@ -302,7 +312,11 @@ def _fair(
                     z = z0 if a == 0 else (z1 if a == 1 else z2)
                     g = w[i] * (X[i, a] - T[i, a]) + alpha * z
                     vel[i, a] = momentum * vel[i, a] - step * g / d
-                    Xn[i, a] = X[i, a] + vel[i, a]
+                    x = X[i, a] + vel[i, a]
+                    if x < lo[a] or x > hi[a]:  # on the box: stop there
+                        x = min(max(x, lo[a]), hi[a])
+                        vel[i, a] = 0.0
+                    Xn[i, a] = x
         if len(gq):
             held[:] = False
             if _guard(X, Xn, gE, gq, gax, gsg, gmin, held):
@@ -403,8 +417,11 @@ def _swept(X, X0, quads):
 
 
 @nb.njit(parallel=True, cache=True)
-def _shift(X, an, area, off, fixed, p_ptr, p_idx):
-    """Move every point back by the offsets off of its quads along their normals."""
+def _shift(X, an, area, off, fixed, p_ptr, p_idx, lo, hi):
+    """
+    Move every point back by the offsets off of its quads along their
+    normals, clamped to the box [lo, hi].
+    """
     Xn = X.copy()
     for i in nb.prange(len(X)):
         sh = np.zeros(3)
@@ -416,17 +433,17 @@ def _shift(X, an, area, off, fixed, p_ptr, p_idx):
             ar += area[q]
         for a in range(3):
             if not fixed[i, a]:
-                Xn[i, a] += sh[a] / max(ar, 1e-300)
+                Xn[i, a] = min(max(Xn[i, a] + sh[a] / max(ar, 1e-300), lo[a]), hi[a])
     return Xn
 
 
-def _restore_volume(X, X0, quads, fixed, p_ptr, p_idx, e_ptr, e_idx, rounds):
+def _restore_volume(X, X0, quads, fixed, p_ptr, p_idx, e_ptr, e_idx, rounds, lo, hi):
     """
     Pass 2: per quad the volume swept from X0 to X, averaged over the quads
     within `rounds` edge steps of the same interface (two box averages of
     radius rounds // 2 and rounds - rounds // 2 in a row, i.e. tent-like
     weights); every point is moved back along the normals of its quads by
-    the averaged volume / area.
+    the averaged volume / area, clamped to the box [lo, hi].
     """
     an, area, V = _swept(X, X0, quads)
     nchunk = 4 * nb.get_num_threads()
@@ -437,17 +454,20 @@ def _restore_volume(X, X0, quads, fixed, p_ptr, p_idx, e_ptr, e_idx, rounds):
         A = area
     V, A = _box_filter(V, A, e_ptr, e_idx, rounds - h, nchunk)
     off = V / np.maximum(A, 1e-300)
-    return _shift(X, an, area, off, fixed, p_ptr, p_idx)
+    return _shift(X, an, area, off, fixed, p_ptr, p_idx, lo, hi)
 
 
 @nb.njit(parallel=True, cache=True)
-def _project(X, X0, fixed, quads, p_ptr, p_idx, fmin, fmax, r):
-    """Final projection into the distance limit (in place)."""
+def _project(X, X0, fixed, quads, p_ptr, p_idx, fmin, fmax, r, lo, hi):
+    """
+    Final projection into the distance limit, then into the box [lo, hi] (in
+    place; the box contains S0, so the second doesn't undo the first).
+    """
     for i in nb.prange(len(X)):
         t0, t1, t2 = _tube(X[i, 0], X[i, 1], X[i, 2], X0, quads, p_ptr, p_idx, fmin, fmax, i, r)
-        X[i, 0] = X0[i, 0] if fixed[i, 0] else t0
-        X[i, 1] = X0[i, 1] if fixed[i, 1] else t1
-        X[i, 2] = X0[i, 2] if fixed[i, 2] else t2
+        X[i, 0] = X0[i, 0] if fixed[i, 0] else min(max(t0, lo[0]), hi[0])
+        X[i, 1] = X0[i, 1] if fixed[i, 1] else min(max(t1, lo[1]), hi[1])
+        X[i, 2] = X0[i, 2] if fixed[i, 2] else min(max(t2, lo[2]), hi[2])
 
 
 @nb.njit(parallel=True, cache=True)
@@ -514,7 +534,8 @@ def fair_surface_net(
     dead_zone and max_distance are in units of dx; None switches them off.
     fix_bounds keeps points on the faces of the box bounds (default: the
     bounding box of surf; pass the image bounds for the range guarantee) on
-    their box face; fixed: optional (n_points, 3) mask of coordinates that
+    their box face, and every point inside the box (clamped; given bounds
+    clamp even without fix_bounds); fixed: optional (n_points, 3) mask of coordinates that
     must not move. guard: optional smoothing.PlanarGuard (planar_guard, valid
     at the points of surf) of planar quads that every step keeps valid: a
     point whose move would break one keeps its position in that step (in the
@@ -553,8 +574,15 @@ def fair_surface_net(
     labels = np.asarray(surf.cell_data[label_name]).astype(np.int64)
 
     fixed = np.zeros((n, 3), bool) if fixed is None else np.asarray(fixed, bool).copy()
+    box = surf.bounds if bounds is None else bounds
     if fix_bounds:
-        fixed |= _bounds_mask(X0, surf.bounds if bounds is None else bounds)
+        fixed |= _bounds_mask(X0, box)
+    if fix_bounds or bounds is not None:
+        box_lo, box_hi = (
+            np.ascontiguousarray(v, np.float64) for v in np.asarray(box, float).reshape(3, 2).T
+        )
+    else:
+        box_lo, box_hi = np.full(3, -np.inf), np.full(3, np.inf)
 
     A = build_stencils(quads, n, degenerate=degenerate)
     L = sp.eye(n, format="csr") - A
@@ -581,7 +609,7 @@ def fair_surface_net(
     X = _fair(
         X0, quads, fixed, junction, g.extra, g.quads, g.axis, g.sign, g.min_area2,
         a_ptr, a_idx, a_val, lt_ptr, lt_idx, lt_val, bound,
-        p_ptr, p_idx, fmin, fmax,
+        p_ptr, p_idx, fmin, fmax, box_lo, box_hi,
         float(alpha), 0.0 if dead_zone is None else dead_zone * dx, r, float(stiffness),
         float(step), float(momentum), dead_zone is not None, max_distance is not None,
         iterations,
@@ -589,12 +617,14 @@ def fair_surface_net(
     if volume:
         e_ptr, e_idx = _edge_neighbours(quads, labels, p_ptr, p_idx)
         for _ in range(int(volume_repeats)):
-            Xv = _restore_volume(X, X0, quads, fixed, p_ptr, p_idx, e_ptr, e_idx, int(volume_rings))
+            Xv = _restore_volume(
+                X, X0, quads, fixed, p_ptr, p_idx, e_ptr, e_idx, int(volume_rings), box_lo, box_hi
+            )
             apply_guard(X, Xv, guard)
             X = Xv
     if max_distance is not None:
         Xp = X.copy()
-        _project(Xp, X0, fixed, quads, p_ptr, p_idx, fmin, fmax, r)
+        _project(Xp, X0, fixed, quads, p_ptr, p_idx, fmin, fmax, r, box_lo, box_hi)
         apply_guard(X, Xp, guard)
         X = Xp
 

@@ -65,3 +65,33 @@ def test_unknown_method_raises(case):
     _, grid, _ = case
     with pytest.raises(ValueError):
         extract_surface(grid, method="nope")
+
+
+def dented_face(dent, n=12):
+    """A cell (2) filling a box; ECS (1) in a slab and in a one-voxel dent of the x = 0 face."""
+    img = np.full((n, n + 5, n + 5), 2, np.uint32)
+    img[-3:] = 1
+    for y, z in dent:
+        img[0, y, z] = 1
+    return np2pv(img, (DX,) * 3)
+
+
+@pytest.mark.parametrize(
+    "dent, kwargs",
+    [
+        # the dents of a real case (flyhedra fb_2um_sep) whose floors slid out of the box
+        ([(7, 7), (9, 7), (9, 8), (9, 10), (10, 7), (10, 8)], {}),
+        ([(7, 7), (9, 7), (9, 8), (9, 10), (10, 7), (10, 8)], {"max_distance": 0.5}),
+        ([(5, 5), (5, 6)], {"max_distance": 0.5, "influence_radius": 40}),
+    ],
+)
+def test_fair_stays_in_box(dent, kwargs):
+    """The fairing shrinks a dent in the box face; its floor must not leave the box."""
+    grid = dented_face(dent)
+    surf = extract_surface(grid, method="fair", **kwargs)
+    P = np.asarray(surf.points)
+    lo, hi = np.asarray(grid.bounds).reshape(3, 2).T
+    assert (P >= lo).all() and (P <= hi).all()
+    assert np.allclose(surf.bounds, grid.bounds)
+    md = kwargs.get("max_distance", 1.0)
+    assert surf.field_data["max_surface_distance"][0] <= md * DX * (1 + 1e-9)
