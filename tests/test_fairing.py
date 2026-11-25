@@ -67,6 +67,16 @@ def test_unknown_method_raises(case):
         extract_surface(grid, method="nope")
 
 
+def assert_in_box(surf, grid, margin=0.1):
+    """Every coordinate on a box face or margin dx inside it (the dent floors keep volume)."""
+    P = np.asarray(surf.points)
+    lo, hi = np.asarray(grid.bounds).reshape(3, 2).T
+    on = (P == lo) | (P == hi)
+    m = margin * DX * (1 - 1e-12)
+    assert ((P >= lo + m) & (P <= hi - m) | on).all()
+    assert np.allclose(surf.bounds, grid.bounds)
+
+
 def dented_face(dent, n=12):
     """A cell (2) filling a box; ECS (1) in a slab and in a one-voxel dent of the x = 0 face."""
     img = np.full((n, n + 5, n + 5), 2, np.uint32)
@@ -86,14 +96,11 @@ def dented_face(dent, n=12):
     ],
 )
 def test_fair_stays_in_box(dent, kwargs):
-    """The fairing shrinks a dent in the box face; its floor must not leave the box."""
+    """The fairing shrinks a dent in the box face; its floor must stay inside the box."""
     grid = dented_face(dent)
     surf = extract_surface(grid, method="fair", **kwargs)
-    P = np.asarray(surf.points)
-    lo, hi = np.asarray(grid.bounds).reshape(3, 2).T
-    assert (P >= lo).all() and (P <= hi).all()
-    assert np.allclose(surf.bounds, grid.bounds)
-    md = kwargs.get("max_distance", 1.0)
+    assert_in_box(surf, grid)
+    md = kwargs.get("max_distance", 1.0) + 0.1  # + box_margin next to the box faces
     assert surf.field_data["max_surface_distance"][0] <= md * DX * (1 + 1e-9)
 
 
@@ -103,11 +110,7 @@ def test_fair_stays_in_box(dent, kwargs):
 def test_laplace_stays_in_box(dent):
     """The Laplacian smoothing (method="laplace") keeps the dent floors in the box too."""
     grid = dented_face(dent)
-    surf = extract_surface(grid)
-    P = np.asarray(surf.points)
-    lo, hi = np.asarray(grid.bounds).reshape(3, 2).T
-    assert (P >= lo).all() and (P <= hi).all()
-    assert np.allclose(surf.bounds, grid.bounds)
+    assert_in_box(extract_surface(grid), grid)
 
 
 def test_constrained_smooth_clamps_to_bounds():
@@ -125,3 +128,7 @@ def test_constrained_smooth_clamps_to_bounds():
     P = constrained_smooth(x, A, iterations=4, relaxation=1.0, distance=np.inf, bounds=box)
     assert (P >= 0.0).all() and (P <= 1.0).all()
     assert P[0, 0] == 0.0
+    P = constrained_smooth(
+        x, A, iterations=4, relaxation=1.0, distance=np.inf, bounds=box, margin=0.1
+    )
+    assert P[0, 0] == 0.1 and P[2, 0] == 0.9

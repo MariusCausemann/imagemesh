@@ -221,7 +221,8 @@ def _degenerate_diagonals(faces, i, j, n_points):
 @nb.njit(parallel=True, cache=True)
 def _smooth_step(indptr, indices, data, x0, x, xn, relaxation, d2, fixed, lo, hi):
     """One constrained Jacobi iteration xn <- x + relaxation * (A @ x - x) with A
-    in CSR format, then clamped to the box [lo, hi]; returns max |xn - x|."""
+    in CSR format, the free coordinates clamped to the box [lo, hi]; returns
+    max |xn - x|."""
     moved = 0.0
     for i in nb.prange(len(x)):
         a0 = a1 = a2 = 0.0
@@ -245,9 +246,12 @@ def _smooth_step(indptr, indices, data, x0, x, xn, relaxation, d2, fixed, lo, hi
             f = np.sqrt(d2 / r2)
             y0, y1, y2 = x0[i, 0] + u0 * f, x0[i, 1] + u1 * f, x0[i, 2] + u2 * f
         # the box contains x0: clamping keeps the sphere constraint
-        y0 = min(max(y0, lo[0]), hi[0])
-        y1 = min(max(y1, lo[1]), hi[1])
-        y2 = min(max(y2, lo[2]), hi[2])
+        if not fixed[i, 0]:
+            y0 = min(max(y0, lo[0]), hi[0])
+        if not fixed[i, 1]:
+            y1 = min(max(y1, lo[1]), hi[1])
+        if not fixed[i, 2]:
+            y2 = min(max(y2, lo[2]), hi[2])
         xn[i, 0], xn[i, 1], xn[i, 2] = y0, y1, y2
         m = max(abs(y0 - x[i, 0]), abs(y1 - x[i, 1]), abs(y2 - x[i, 2]))
         moved = max(moved, m)
@@ -256,7 +260,7 @@ def _smooth_step(indptr, indices, data, x0, x, xn, relaxation, d2, fixed, lo, hi
 
 def constrained_smooth(
     points, A, iterations=16, relaxation=0.5, distance=1.0, convergence=0.0, fixed=None,
-    guard=None, bounds=None,
+    guard=None, bounds=None, margin=0.0,
 ):  # fmt: skip
     """
     vtkConstrainedSmoothingFilter with a sphere constraint.
@@ -265,8 +269,9 @@ def constrained_smooth(
     e.g. fixed[k, 2] = True keeps point k in its z-plane. guard: optional
     PlanarGuard (planar_guard) of quads that every step keeps valid.
     bounds: optional box (xmin, xmax, ymin, ymax, zmin, zmax) containing the
-    points; every step clamps them to it (with an averaging A the steps stay
-    in it up to rounding anyway; with other weights they may not).
+    points; every step clamps the free coordinates to it, margin inside its
+    faces (the start points must lie in that interval). With an averaging A
+    the steps stay in the box up to rounding anyway, not in the margin.
     """
     x0 = np.ascontiguousarray(points, dtype=np.float64)
     x = x0.copy()
@@ -278,9 +283,8 @@ def constrained_smooth(
     if bounds is None:
         lo, hi = np.full(3, -np.inf), np.full(3, np.inf)
     else:
-        lo, hi = (
-            np.ascontiguousarray(v, np.float64) for v in np.asarray(bounds, float).reshape(3, 2).T
-        )
+        lo, hi = np.asarray(bounds, float).reshape(3, 2).T
+        lo, hi = np.ascontiguousarray(lo + margin), np.ascontiguousarray(hi - margin)
     for _ in range(iterations):
         moved = _smooth_step(
             A.indptr, A.indices, A.data, x0, x, xn, relaxation, distance**2, fixed, lo, hi
@@ -361,6 +365,7 @@ def smooth_surface_net(
     triangulate=True,
     degenerate="full",
     bounds=None,
+    margin=0.0,
 ):
     """
     Smooth a surface from contour_labels(smoothing=False, output_mesh_type="quads")
@@ -373,7 +378,10 @@ def smooth_surface_net(
     bounding box; pass the image bounds) (clamped). build_stencils' stencils
     are averages, so a step is a convex combination and stays in the box up
     to rounding; the clamp makes it exact (an average of points on a box face
-    may round past it). Given bounds clamp even without fix_bounds.
+    may round past it). Given bounds clamp even without fix_bounds. margin:
+    the free coordinates stay that far inside the box faces (a one-voxel dent
+    in a box face shrinks towards the face; without it its floor may end on
+    the face, a region of no volume).
     degenerate: see build_stencils; None is the VTK behaviour.
     """
     quads = surf.regular_faces
@@ -388,7 +396,7 @@ def smooth_surface_net(
 
     pts = constrained_smooth(
         surf.points, A, iterations, relaxation, distance * scale, fixed=fixed,
-        bounds=box if fix_bounds or bounds is not None else None,
+        bounds=box if fix_bounds or bounds is not None else None, margin=margin,
     )  # fmt: skip
     if not triangulate:
         out = surf.copy()

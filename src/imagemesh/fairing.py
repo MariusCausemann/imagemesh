@@ -37,16 +37,25 @@ the shift is a smooth field and the surface stays fair while every region
 keeps its volume. A volume feedback inside pass 1 would act on lagged,
 narrow measurements (see the range below) and leave dimples.
 
-A final projection guarantees dist(x_i, S0) <= max_distance for every point.
+A final projection guarantees dist(x_i, S0) <= max_distance for every point
+(+ box_margin near the box faces, see below).
 
 Box. Every point stays inside the box `bounds` (the image bounds): the
 fairing steps, the volume restoration and the final projection clamp each
-coordinate to it. The distance limit alone does not keep a point inside: S0
-includes the voxel faces on the box, and a point may slide along S0 out of
-it (e.g. the floor of a one-voxel dent in the box face, which the fairing
-shrinks). Clamping is the projection onto the box, which contains S0, so it
-never increases the distance to S0, and it reads the point only (the range
-below is unchanged).
+free coordinate to it, box_margin dx inside its faces (the points on a box
+face keep their face). The distance limit alone does not keep a point
+inside: S0 includes the voxel faces on the box, and a point may slide along
+S0 out of it (e.g. the floor of a one-voxel dent in the box face, which the
+fairing shrinks). Without the margin such a floor would end on the box face,
+on top of the box faces of the dent: a region of no volume. A free
+coordinate starts on a voxel corner off the face, at least dx inside, so the
+clamp interval contains its start. Such a floor slides along the box faces
+(they are part of S0, so the distance limit allows it) and the projection
+onto S0 would take it back next to the face, so the margin comes last: near
+the box faces the distance limit is max_distance + box_margin (the clamp
+moves a point by at most the margin from the box, which contains S0), and
+exact elsewhere. Clamping reads the point only (the range below is
+unchanged).
 
 Range of influence. Measure the distance between a surface point and a
 voxel in voxels, as the L-infinity distance from the point's voxel corner to
@@ -460,8 +469,9 @@ def _restore_volume(X, X0, quads, fixed, p_ptr, p_idx, e_ptr, e_idx, rounds, lo,
 @nb.njit(parallel=True, cache=True)
 def _project(X, X0, fixed, quads, p_ptr, p_idx, fmin, fmax, r, lo, hi):
     """
-    Final projection into the distance limit, then into the box [lo, hi] (in
-    place; the box contains S0, so the second doesn't undo the first).
+    Final projection into the distance limit, then the free coordinates into
+    the margin box [lo, hi] (in place; the clamp moves a point by at most the
+    margin from the box, which contains S0).
     """
     for i in nb.prange(len(X)):
         t0, t1, t2 = _tube(X[i, 0], X[i, 1], X[i, 2], X0, quads, p_ptr, p_idx, fmin, fmax, i, r)
@@ -505,6 +515,7 @@ def fair_surface_net(
     label_name="boundary_labels",
     fix_bounds=True,
     bounds=None,
+    box_margin=0.1,
     fixed=None,
     guard=None,
     stiffness=100.0,
@@ -534,10 +545,11 @@ def fair_surface_net(
     dead_zone and max_distance are in units of dx; None switches them off.
     fix_bounds keeps points on the faces of the box bounds (default: the
     bounding box of surf; pass the image bounds for the range guarantee) on
-    their box face, and every point inside the box (clamped; given bounds
-    clamp even without fix_bounds); fixed: optional (n_points, 3) mask of coordinates that
-    must not move. guard: optional smoothing.PlanarGuard (planar_guard, valid
-    at the points of surf) of planar quads that every step keeps valid: a
+    their box face, and every other coordinate box_margin dx inside the box
+    faces (clamped; given bounds clamp even without fix_bounds); fixed:
+    optional (n_points, 3) mask of coordinates that must not move. guard:
+    optional smoothing.PlanarGuard (planar_guard, valid at the points of surf)
+    of planar quads that every step keeps valid: a
     point whose move would break one keeps its position in that step (in the
     fairing steps, the volume restoration and the final projection; such a
     point may stay outside the distance limit). step, momentum: of the heavy-ball Jacobi steps.
@@ -578,9 +590,9 @@ def fair_surface_net(
     if fix_bounds:
         fixed |= _bounds_mask(X0, box)
     if fix_bounds or bounds is not None:
-        box_lo, box_hi = (
-            np.ascontiguousarray(v, np.float64) for v in np.asarray(box, float).reshape(3, 2).T
-        )
+        m = float(box_margin) * dx
+        lo, hi = np.asarray(box, float).reshape(3, 2).T
+        box_lo, box_hi = np.ascontiguousarray(lo + m), np.ascontiguousarray(hi - m)
     else:
         box_lo, box_hi = np.full(3, -np.inf), np.full(3, np.inf)
 

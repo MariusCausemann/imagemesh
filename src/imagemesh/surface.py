@@ -22,6 +22,7 @@ def extract_surface(
     background_value=0,
     degenerate=None,
     method="laplace",
+    box_margin=0.1,
     **fair_kwargs,
 ):
     """
@@ -46,6 +47,9 @@ def extract_surface(
     curves; "full" un-pins those corners at every voxel step of a one-voxel-wide
     strip between two junction curves (e.g. where the falx meets the outer
     boundary) and creases the strip by up to a voxel.
+
+    box_margin: the points off the bounding box stay box_margin dx inside it
+    (both methods), so that a one-voxel dent in a box face keeps some volume.
     """
     surf = surface_quads(grid, scalars=scalars, background_value=background_value)
     dx = np.min(grid.spacing)
@@ -57,6 +61,7 @@ def extract_surface(
             dx,
             iterations=iterations,
             bounds=grid.bounds,
+            box_margin=box_margin,
             degenerate=degenerate,
             **fair_kwargs,
         )
@@ -71,6 +76,7 @@ def extract_surface(
         scale=smoothing_scale,
         fix_bounds=True,
         bounds=grid.bounds,
+        margin=box_margin * dx,
         degenerate=degenerate,
     )
     surf.field_data["dx"] = [dx]
